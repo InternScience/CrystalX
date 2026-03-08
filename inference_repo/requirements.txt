@@ -8,6 +8,9 @@ rdkit
 requests
 scipy
 sympy
-torch
-torch_geometric
+torch==2.4.0+cu121
+torch_cluster==1.6.3+pt24cu121
+torch-geometric==2.7.0
+torch_scatter==2.1.2+pt24cu121
+torch_sparse==0.6.18+pt24cu121
 tqdm
