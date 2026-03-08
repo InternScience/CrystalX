@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Large training artifacts
+*.pt
+*.pth
+*.ckpt
+
+# OS files
+.DS_Store

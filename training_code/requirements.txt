@@ -1,0 +1,18 @@
+# Core runtime
+ase
+beautifulsoup4
+matplotlib
+numpy
+pandas
+rdkit
+requests
+scipy
+sympy
+torch
+torch_geometric
+tqdm
+
+# Training-specific
+joblib
+scikit-learn
+seaborn
