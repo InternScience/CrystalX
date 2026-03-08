@@ -1,0 +1,129 @@
+data_xcalibur
+_audit_creation_date           2024-07-03
+_audit_creation_method         'CrysAlisPro 1.171.43.129a (Rigaku OD, 2024)'
+_computing_data_collection     'CrysAlisPro system (CCD 43.129a 64-bit (release 29-06-2024))'
+_computing_cell_refinement     'CrysAlisPro 1.171.43.129a (Rigaku OD, 2024)'
+_computing_data_reduction      'CrysAlisPro 1.171.43.129a (Rigaku OD, 2024)'
+_cell_length_a                  9.69825(15) 
+_cell_length_b                  32.0207(6) 
+_cell_length_c                  10.40268(17) 
+_cell_angle_alpha               90.0 
+_cell_angle_beta                101.0217(15) 
+_cell_angle_gamma               90.0 
+_cell_volume                    3170.91(9) 
+_cell_measurement_temperature   300.49(10) 
+_cell_measurement_reflns_used   9903
+_cell_measurement_theta_min     2.7280
+_cell_measurement_theta_max     76.0020
+_cell_oxdiff_length_a                  9.69841(14) 
+_cell_oxdiff_length_b                  32.0223(6) 
+_cell_oxdiff_length_c                  10.40256(17) 
+_cell_oxdiff_angle_alpha               89.9755(14) 
+_cell_oxdiff_angle_beta                101.0375(13) 
+_cell_oxdiff_angle_gamma               89.9945(13) 
+_cell_oxdiff_volume                    3170.91(9) 
+_cell_oxdiff_measurement_reflns_used   10127
+_exptl_absorpt_correction_T_min                   0.77881
+_exptl_absorpt_correction_T_max                   1.00000
+_exptl_absorpt_correction_type            multi-scan
+_exptl_absorpt_process_details
+;
+CrysAlisPro 1.171.43.129a (Rigaku Oxford Diffraction, 2024)
+Empirical absorption correction using spherical harmonics,
+implemented in SCALE3 ABSPACK scaling algorithm.
+;
+_oxdiff_exptl_absorpt_empirical_full_min           0.710
+_oxdiff_exptl_absorpt_empirical_full_max           1.673
+_oxdiff_exptl_absorpt_empirical_details
+;
+Empirical correction (ABSPACK) includes:
+- Absorption correction using spherical harmonics
+- Frame scaling
+;
+_diffrn_ambient_temperature 300.49(10) 
+_diffrn_ambient_environment air
+_diffrn_source 'Rotating-anode X-ray tube'
+_diffrn_source_type 'Rigaku (Cu) X-ray Source'
+_diffrn_radiation_probe x-ray
+_diffrn_radiation_type 'Cu K\a'
+_diffrn_radiation_wavelength 1.54184
+_diffrn_radiation_monochromator mirror
+_diffrn_measurement_device 'four-circle diffractometer'
+_diffrn_measurement_device_type 'ROD, Synergy Custom system, HyPix-Arc 150'
+_diffrn_detector 'Hybrid Pixel Array Detector'
+_diffrn_detector_type 'HyPix-Arc 150'
+_diffrn_detector_area_resol_mean 10.0000
+_diffrn_reflns_number 13232
+_diffrn_reflns_av_R_equivalents 0.0256
+_diffrn_reflns_av_sigmaI/netI 0.0290
+_diffrn_reflns_limit_h_min -7
+_diffrn_reflns_limit_h_max 11
+_diffrn_reflns_limit_k_min -39
+_diffrn_reflns_limit_k_max 39
+_diffrn_reflns_limit_l_min -12
+_diffrn_reflns_limit_l_max 12
+_diffrn_reflns_theta_min 2.7599
+_diffrn_reflns_theta_max 76.2667
+_diffrn_measured_fraction_theta_max 0.6512
+_diffrn_reflns_theta_full 66.9682
+_diffrn_measured_fraction_theta_full 0.9893
+_diffrn_orient_matrix_type 'CrysAlisPro convention (1999,Acta A55,543-557)'
+_diffrn_orient_matrix_UB_11      -0.0069713000
+_diffrn_orient_matrix_UB_12      -0.0397923000
+_diffrn_orient_matrix_UB_13       0.0817926000
+_diffrn_orient_matrix_UB_21      -0.0141251000
+_diffrn_orient_matrix_UB_22      -0.0267303000
+_diffrn_orient_matrix_UB_23      -0.1249402000
+_diffrn_orient_matrix_UB_31       0.1610725000
+_diffrn_orient_matrix_UB_32      -0.0040750000
+_diffrn_orient_matrix_UB_33       0.0216104000
+_diffrn_measurement_details
+;
+List of Runs (angles in degrees, time in seconds):
+
+  # Type    Start    End  Width  t~exp~   \w     \q     \k     \f   Frames
+--------------------------------------------------------------------------
+  1  \w    -92.00 -67.00   0.50    0.05    --  -64.05 -15.00-150.00   50
+  2  \w   -102.00 -59.00   0.50    0.05    --  -64.05 -15.00-120.00   86
+  3  \w   -112.00 -87.00   0.50    0.05    --  -71.48 -15.00-120.00   50
+  4  \w   -120.00 -76.00   0.50    0.05    --  -81.63 -15.00-150.00   88
+  5  \w   -118.00 -76.00   0.50    0.05    --  -81.63 -15.00 -60.00   84
+  6  \w   -116.00 -78.00   0.50    0.05    --  -76.97 -15.00 -30.00   76
+  7  \w   -113.00 -88.00   0.50    0.05    --  -81.63 -15.00   0.00   50
+  8  \w   -104.00 -64.00   0.50    0.05    --  -64.05 -15.00  90.00   80
+  9  \w     69.00 116.00   0.50    0.05    --   76.36  15.00-120.00   94
+ 10  \w     42.00  91.00   0.50    0.05    --   76.36-125.00 -60.00   98
+ 11  \w     65.00  91.00   0.50    0.05    --   76.36-125.00-150.00   52
+ 12  \w     50.00  75.00   0.50    0.05    --   76.36-125.00   0.00   50
+ 13  \w     27.00  77.00   0.50    0.05    --   62.91-125.00 120.00  100
+ 14  \w     35.00  76.00   0.50    0.05    --   71.51-125.00 150.00   82
+ 15  \w     41.00  66.00   0.50    0.05    --   76.36-123.00 175.00   50
+ 16  \w     36.00  61.00   0.50    0.05    --   71.51-123.00 175.00   50
+ 17  \w     30.00  62.00   0.50    0.05    --   62.91-123.00 175.00   64
+ 18  \w    -92.00 -42.00   0.50    0.05    --  -76.97 125.00 150.00  100
+ 19  \w    -97.00 -72.00   0.50    0.05    --  -81.63 125.00 150.00   50
+ 20  \w    -97.00 -71.00   0.50    0.05    --  -81.63 125.00 120.00   52
+ 21  \w    -94.00 -68.00   0.50    0.05    --  -81.63 125.00  90.00   52
+ 22  \w    -97.00 -48.00   0.50    0.05    --  -81.63 125.00 -30.00   98
+ 23  \w    -96.00 -44.00   0.50    0.05    --  -81.63 123.00-104.00  104
+ 24  \w    -90.00 -65.00   0.50    0.05    --  -76.97 123.00-104.00   50
+ 25  \w    -60.00 -35.00   0.50    0.05    --  -71.48 123.00-104.00   50
+ 26  \w    -77.00 -52.00   0.50    0.05    --  -64.05 123.00-104.00   50
+ 27  \w    -97.00 -69.00   0.50    0.05    --  -81.63 125.00-150.00   56
+;
+_diffrn_measurement_method '\w scans'
+_diffrn_oxdiff_digest_frames
+;
+01fb1af8d182296eac923e65731c39943f000504788
+;
+_diffrn_oxdiff_digest_hkl
+;
+43dbf98887abb6bbf143377180483aaa0f63ed
+;
+_space_group_IT_number 9
+_space_group_crystal_system monoclinic
+_space_group_name_H-M_alt 'I 1 a 1'
+_reflns_odcompleteness_completeness		98.93
+_reflns_odcompleteness_theta		66.97
+_reflns_odcompleteness_iscentric		1
+_chemical_oxdiff_formula CHOBBrN
