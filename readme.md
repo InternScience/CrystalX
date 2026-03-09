@@ -1,113 +1,130 @@
-# CrystalX - Training and Data Processing
+# CrystalX Workspace
 
-## 1. Environment Preparation
+This workspace is organized into three parts:
 
-### Device
-- A Linux x86 platform
-- Single RTX 4090 GPU with CUDA Version: 12.2
+- `data_pipeline/`: dataset splitting, test-subset collection, SHELX input preparation, and simple batch SHELX execution
+- `training_code/`: cleaned training package with the heavy-atom and hydrogen trainers
+- `inference_repo/`: cleaned inference package with heavy, hydro, joint, and demo inference entrypoints
 
-### Python Environment Installation
-Set up the Python environment by following these steps:
+## Repository Layout
 
-```bash
-# Create a new conda environment with Python 3.12
-conda create -n test_xrd python=3.12
-
-# Activate the new environment
-conda activate test_xrd
-
-# Install cctbx-base using conda
-conda install -c conda-forge cctbx-base
-
-# Install PyTorch and related packages
-pip install torch
-pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+cu121.html
-
-# Install additional dependencies
-pip install ase
-pip install rdkit
-pip install tqdm
-pip install torch_geometric
+```text
+xrd_code/
+  data_pipeline/
+  training_code/
+  inference_repo/
+  environment.yml
+  readme.md
 ```
 
-### Required Binaries
-The following binary programs are required:
-- **SHELXT**
-- **SHELXL**
-- **PLATON**
+## Environment
 
-They can all be downloaded freely from their respective official websites.
+The shared conda environment file is `environment.yml`.
 
-## 2. Data Preparation
+Create the environment with:
 
-### Data Download
-- Download real data: `realdata_download.py`
+```bash
+conda env create -f environment.yml
+conda activate test_xrd
+```
 
-### File Organization & Format Conversion
-- Organize downloaded files: `file_organize.py`
-- Generate PDB formats: `gen_pdb.py`
+The environment is centered on:
 
-### Extract Diffraction Data
-- Extract embedded diffraction data from CIF files using PLATON: `PLATON_cif2hkl.py`
+- Python 3.12
+- PyTorch 2.4.0 with CUDA 12.1 wheels
+- PyTorch Geometric and matching scatter/cluster/sparse extensions
+- `cctbx-base`
+- `ase`
+- `rdkit`
+- `scikit-learn`
+- `sympy`
+- `tqdm`
 
-### HKL File Processing
-- Convert individual **HKL** files to the SHELX suite "HKL 4" supported format: `process_hkl.py`
+External binaries still required outside Python:
 
-### INS File Preparation
-- Write CIF files into initial INS files: `process_cif.py`
+- `SHELXT`
+- `SHELXL`
+- `PLATON`
 
-### Automatic Phasing
-- Run automatic phasing with SHELXT using the prepared INS and HKL files: `SHELXT_process_final.py`
+## Data Pipeline
 
-### Target matching
-- Match phasing results with human experts’ analysis: `trainer_prepare_all_eval_add.py`
+`data_pipeline/` is a standalone utilities directory, grouped into:
 
-> **Note**: The dataset consists of 51,433 entries, located in `all_cif`, with the annotated coarse electron density available at `all_anno_density`.
+- `split/`: build `train_ids`, `test_ids`, and `missing_ids`
+- `collect/`: copy selected sample folders and gather CIF files
+- `prepare/`: convert CIF to INS, generate or repair HKL files, and assemble SHELX-ready inputs
+- `run/`: simple batch SHELXT and SHELXL runners
+- `scripts/`: shell wrappers showing the intended step order
 
----
+Typical flow from the workspace root:
 
-## 3. Models
+```bash
+sh data_pipeline/scripts/01_save_split_ids.sh
+sh data_pipeline/scripts/02_collect_test_subset.sh
+sh data_pipeline/scripts/03_prepare_shelx_inputs.sh
+sh data_pipeline/scripts/04_run_shelx.sh
+```
 
-The following models are utilized in the training:
+To also run SHELXL in the last step:
 
-- **SchNet**: `schnet.py`
-- **ComENet**: `comenet.py`
-- **DimeNet**: `dimenet.py`
-- **SphereNet**: `spherenet.py`
-- **TorchMD-Net**: 
-  - `torchmd_net.py`
-  - `torchmd_et.py`
-  - `torchmd_utils.py`
-  - `noise_output_model.py`
+```bash
+RUN_SHELXL=1 sh data_pipeline/scripts/04_run_shelx.sh
+```
 
----
+## Training
 
-## 4. Training & Evaluation
+`training_code/` is intentionally trimmed to only the code path needed by its two shell entrypoints:
 
-### Heavy Elemental Determination
+- `sh training_code/scripts/train/train_heavy.sh`
+- `sh training_code/scripts/train/train_hydro.sh`
 
-- **Training**: `trainer_coarse2fine_crystal_add_10fold.py`
-- **Evaluation**: `trainer_coarse2fine_crystal_add_eval.py`
+Equivalent Python entrypoints:
 
-### Hydrogen Atom Determination
+```bash
+cd training_code
+python -m crystalx_train.trainers.trainer_heavy
+python -m crystalx_train.trainers.trainer_hydro
+```
 
-- **Training**: `trainer_hydro_denoiser_add_10fold.py`
-- **Evaluation**: `trainer_hydro_denoiser_add_eval.py`
+The package keeps only:
 
----
+- `crystalx_train.models`
+- `crystalx_train.trainers`
 
-## 5. Crystallographic Computing & Error Correction
+## Inference
 
-- **Run automatic SHELXL processing**: `SHELXL_process.py`
-- **Run automatic weight refinement**: `weight_refine.py`
-- **Crystallographic comparison for error correction**:
-  - Main comparison: `wr2_compare_main.py`
-  - Hydrogen comparison: `wr2_compare_hydro.py`
+`inference_repo/` contains the cleaned inference and demo path. Main shell entrypoints:
 
----
+- `sh inference_repo/scripts/infer_heavy.sh ...`
+- `sh inference_repo/scripts/infer_hydro.sh ...`
+- `sh inference_repo/scripts/infer_joint.sh ...`
+- `sh inference_repo/scripts/run_demo.sh <file_prefix>`
+- `sh inference_repo/scripts/run_demo_batch.sh [ROOT_DIR]`
 
-## 6. Utility Functions
+Equivalent Python entrypoints from inside `inference_repo`:
 
-- Various utility functions: `utils.py`
+```bash
+python -m crystalx_infer.pipelines.infer_heavy_temporal
+python -m crystalx_infer.pipelines.infer_hydro_temporal
+python -m crystalx_infer.pipelines.infer_joint_heavy_hydro_temporal
+```
 
+The inference package keeps only the modules required by those scripts:
 
+- `crystalx_infer.common`
+- `crystalx_infer.models`
+- `crystalx_infer.pipelines`
+- `crystalx_infer.postprocess`
+
+## Suggested Order
+
+1. Create the conda environment from `environment.yml`.
+2. Use `data_pipeline/` to prepare split files and SHELX-ready inputs if needed.
+3. Run `training_code/` to train or reproduce heavy/hydro models.
+4. Run `inference_repo/` for evaluation, demo inference, or joint prediction.
+
+## Notes
+
+- Each subdirectory has its own focused `README.md`.
+- The workspace also contains older legacy scripts at the repository root; they are not the cleaned primary path.
+- The current cleaned workflow is centered on `data_pipeline`, `training_code`, and `inference_repo`.
