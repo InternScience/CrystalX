@@ -30,11 +30,11 @@ training_code/
 ## Entrypoints
 
 - Heavy training:
-  - `python -m crystalx_train.trainers.trainer_coarse2fine_crystal_add_10fold`
-  - `python -m crystalx_train.trainers.trainer_heavy_temporal_log_adamw`
+  - `python -m crystalx_train.trainers.trainer_heavy`
+  - `sh scripts/train/train_heavy.sh`
 - Hydrogen training:
-  - `python -m crystalx_train.trainers.trainer_hydro_denoiser_add_10fold`
-  - `python -m crystalx_train.trainers.trainer_hydro_temporal_log_adamw`
+  - `python -m crystalx_train.trainers.trainer_hydro`
+  - `sh scripts/train/train_hydro.sh`
 - Data preparation:
   - `python -m crystalx_train.data_prep.realdata_download`
   - `python -m crystalx_train.data_prep.process_cif`
