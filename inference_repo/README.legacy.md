@@ -11,9 +11,9 @@ This file preserves the earlier demo-oriented notes after the repository split.
 
 ## Historical Demo Entry
 
-- Single-case demo script: `scripts/temp_demo_new.sh`
-- Batch runner: `scripts/batch_run_all.sh`
-- Heavy stage: `crystalx_infer.pipelines.temp_demo_new_main`
-- Hydro stage: `crystalx_infer.pipelines.temp_demo_new_hydro`
+- Single-case demo script: `scripts/run_demo.sh`
+- Batch runner: `scripts/run_demo_batch.sh`
+- Heavy stage: `crystalx_infer.pipelines.predict_heavy`
+- Hydro stage: `crystalx_infer.pipelines.predict_hydro`
 
 Use `README.md` for the current standalone-repository layout.

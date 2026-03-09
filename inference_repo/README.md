@@ -7,7 +7,6 @@ Standalone inference repository layout for CrystalX.
 ```text
 inference_repo/
   crystalx_infer/
-    analysis/
     common/
     models/
     pipelines/
@@ -27,7 +26,6 @@ inference_repo/
 - `crystalx_infer.models`: TorchMD-based model definitions
 - `crystalx_infer.pipelines`: main inference entrypoints and demo pipelines
 - `crystalx_infer.postprocess`: post-inference structure processing helpers
-- `crystalx_infer.analysis`: result inspection and statistics helpers
 - `scripts`: shell entrypoints for single-case and batch execution
 - `weights`: local model checkpoints used by the demo pipeline
 
@@ -35,14 +33,17 @@ inference_repo/
 
 - Heavy-only inference:
   - `python -m crystalx_infer.pipelines.infer_heavy_temporal`
+  - `sh scripts/infer_heavy.sh ...`
 - Hydro-only inference:
   - `python -m crystalx_infer.pipelines.infer_hydro_temporal`
+  - `sh scripts/infer_hydro.sh ...`
 - Joint inference:
   - `python -m crystalx_infer.pipelines.infer_joint_heavy_hydro_temporal`
+  - `sh scripts/infer_joint.sh ...`
 - Demo pipeline:
-  - `sh scripts/temp_demo_new.sh <file_prefix>`
+  - `sh scripts/run_demo.sh <file_prefix>`
 - Batch demo pipeline:
-  - `sh scripts/batch_run_all.sh [ROOT_DIR]`
+  - `sh scripts/run_demo_batch.sh [ROOT_DIR]`
 
 Run Python commands from the `inference_repo` directory so Python can resolve the `crystalx_infer` package.
 

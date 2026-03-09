@@ -329,7 +329,7 @@ def main():
 
     pt_dir = "/inspire/ssd/project/project-public/zhengkaipeng-240108120123/all_materials/data/all_anno_density"
     txt_path = "sorted_by_journal_year.txt"
-    test_years = (2020, 2021, 2022, 2023, 2024)
+    test_years = (2018, 2019, 2020, 2021, 2022, 2023, 2024)
 
     run_ts = get_run_timestamp()
     metric_log_path = f"train_metric_log_{run_ts}.txt"

@@ -798,7 +798,7 @@ def main():
     parser.add_argument("--heavy_model_path", type=str, required=True)
     parser.add_argument("--hydro_model_path", type=str, required=True)
 
-    parser.add_argument("--test_years", type=int, nargs="+", default=[2019, 2020, 2021, 2022, 2023, 2024])
+    parser.add_argument("--test_years", type=int, nargs="+", default=[2018, 2019, 2020, 2021, 2022, 2023, 2024])
     parser.add_argument("--pt_prefix", type=str, default="equiv_")
     parser.add_argument("--pt_suffix", type=str, default=".pt")
     parser.add_argument("--strict", action="store_true")

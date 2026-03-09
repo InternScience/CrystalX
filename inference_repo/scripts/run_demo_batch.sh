@@ -3,7 +3,7 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PIPELINE_SCRIPT="$SCRIPT_DIR/temp_demo_new.sh"
+PIPELINE_SCRIPT="$SCRIPT_DIR/run_demo.sh"
 
 ROOT_DIR_INPUT="."
 ENABLE_TIMING=0
@@ -49,10 +49,10 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         -h|--help)
-            echo "Usage: sh batch_run_all.sh [ROOT_DIR] [--timing] [--step-timing] [--shuffle] [--shuffle-seed SEED] [--skip-if-ran] [--timing-log FILE]"
+            echo "Usage: sh run_demo_batch.sh [ROOT_DIR] [--timing] [--step-timing] [--shuffle] [--shuffle-seed SEED] [--skip-if-ran] [--timing-log FILE]"
             echo "  ROOT_DIR           Root folder containing case subfolders (default: .)"
             echo "  --timing           Print per-case elapsed seconds"
-            echo "  --step-timing      Print per-python-step elapsed seconds from temp_demo_new.sh"
+            echo "  --step-timing      Print per-python-step elapsed seconds from run_demo.sh"
             echo "  --shuffle          Randomize case execution order"
             echo "  --shuffle-seed N   Randomize with reproducible seed N (implies --shuffle)"
             echo "  --skip-if-ran      Skip case if dated output folder already exists"

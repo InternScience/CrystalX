@@ -34,7 +34,7 @@ elapsed_1dp() {
 # prepare
 fname="${1:-}"
 if [ -z "$fname" ]; then
-    echo "Usage: sh temp_demo_new.sh <file_prefix>"
+    echo "Usage: sh run_demo.sh <file_prefix>"
     exit 1
 fi
 
@@ -132,8 +132,8 @@ cp "${fname}.ins" "$work_dir/${fname}.ins"
 
 # To do: Check the validility of the phasing results
 
-run_python_step "temp_demo_new_main.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.pipelines.temp_demo_new_main --fname="$fname" --work_dir="$work_dir" --model_path="$main_model_name"
+run_python_step "predict_heavy.py" \
+    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.pipelines.predict_heavy --fname="$fname" --work_dir="$work_dir" --model_path="$main_model_name"
 
 err_mes="$work_dir/ERROR.json"
 if [ -e "$err_mes" ]; then
@@ -145,28 +145,28 @@ fi
 "$shelxl_bin" "$work_dir/${fname}_AI"
 
 # Then build AIBond and run SHELXL to generate connectivity .lst for hydro.
-run_python_step "temp_demo_new_bond_cal.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.postprocess.temp_demo_new_bond_cal --fname="${fname}_AI" --work_dir="$work_dir"
+run_python_step "prepare_bond_inputs.py" \
+    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.postprocess.prepare_bond_inputs --fname="${fname}_AI" --work_dir="$work_dir"
 "$shelxl_bin" "$work_dir/${fname}_AIBond"
 
-run_python_step "temp_demo_new_hydro.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.pipelines.temp_demo_new_hydro --fname="${fname}_AI" --work_dir="$work_dir" --model_path="$hydro_model_name"
+run_python_step "predict_hydro.py" \
+    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.pipelines.predict_hydro --fname="${fname}_AI" --work_dir="$work_dir" --model_path="$hydro_model_name"
 "$shelxl_bin" "$work_dir/${fname}_AIhydro"
 
-run_python_step "temp_demo_new_weight_refine.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.postprocess.temp_demo_new_weight_refine --fname="${fname}_AIhydro" --work_dir="$work_dir"
+run_python_step "prepare_weight_refine.py" \
+    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.postprocess.prepare_weight_refine --fname="${fname}_AIhydro" --work_dir="$work_dir"
 "$shelxl_bin" "$work_dir/${fname}_AIhydroWeight"
 
 # perhaps not needed
-# python temp_demo_new_weight_refine_2.py --fname="${fname}_AIhydroWeight" --work_dir="$work_dir"
+# python prepare_weight_refine_2.py --fname="${fname}_AIhydroWeight" --work_dir="$work_dir"
 # ./shelxl "$work_dir/${fname}_AIhydroWeight2"
 
 # To do: Check the validility of the final results
 
 "$platon_bin" -u "$work_dir/${fname}_AIhydroWeight.cif"
 
-run_python_step "temp_demo_new_write_xyz.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.postprocess.temp_demo_new_write_xyz --fname="${fname}_AIhydroWeight" --work_dir="$work_dir"
+run_python_step "write_final_outputs.py" \
+    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.postprocess.write_final_outputs --fname="${fname}_AIhydroWeight" --work_dir="$work_dir"
 
 print_python_step_summary
 

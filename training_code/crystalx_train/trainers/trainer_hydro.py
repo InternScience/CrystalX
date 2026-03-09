@@ -280,7 +280,7 @@ def main():
 
     pt_dir = "/inspire/ssd/project/project-public/zhengkaipeng-240108120123/all_materials/data/all_anno_density"
     txt_path = "sorted_by_journal_year.txt"
-    test_years = (2019, 2020, 2021, 2022, 2023, 2024)
+    test_years = (2018, 2019, 2020, 2021, 2022, 2023, 2024)
     pt_prefix = "equiv_"
     pt_suffix = ".pt"
 

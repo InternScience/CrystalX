@@ -1,9 +1,8 @@
-import re
-from typing import Optional, List, Tuple
+from typing import Optional
+
 import torch
-from torch.autograd import grad
 from torch import nn
-from torch_scatter import scatter
+
 
 class TorchMD_Net(nn.Module):
     def __init__(
@@ -16,24 +15,21 @@ class TorchMD_Net(nn.Module):
         std=None,
         derivative=False,
         output_model_noise=None,
-        position_noise_scale=0.,
+        position_noise_scale=0.0,
     ):
-        super(TorchMD_Net, self).__init__()
+        super().__init__()
         self.representation_model = representation_model
         self.output_model = output_model
-
         self.prior_model = prior_model
-
         self.reduce_op = reduce_op
         self.derivative = derivative
-        self.output_model_noise = output_model_noise        
+        self.output_model_noise = output_model_noise
         self.position_noise_scale = position_noise_scale
 
         mean = torch.scalar_tensor(0) if mean is None else mean
-        self.register_buffer("mean", mean)
         std = torch.scalar_tensor(1) if std is None else std
+        self.register_buffer("mean", mean)
         self.register_buffer("std", std)
-
 
         self.reset_parameters()
 
@@ -50,13 +46,8 @@ class TorchMD_Net(nn.Module):
         if self.derivative:
             pos.requires_grad_(True)
 
-        # run the potentially wrapped representation model
         x, v, z, pos, batch = self.representation_model(z, pos, batch=batch)
-
-
-        # apply the output network
-        x1 = self.output_model.pre_reduce(x, v, z, pos, batch)
-
-        v = torch.norm(v, dim=-2)
-        x = torch.cat([x, v], dim=-1)
-        return x1, x
+        x_out = self.output_model.pre_reduce(x, v, z, pos, batch)
+        v_norm = torch.norm(v, dim=-2)
+        hidden = torch.cat([x, v_norm], dim=-1)
+        return x_out, hidden

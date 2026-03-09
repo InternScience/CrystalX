@@ -7,11 +7,9 @@ Standalone training repository layout for CrystalX.
 ```text
 training_code/
   crystalx_train/
-    common/
-    data_prep/
     models/
-    postprocess/
     trainers/
+  scripts/
   .gitignore
   pyproject.toml
   requirements.txt
@@ -21,11 +19,9 @@ training_code/
 
 ## Package Layout
 
-- `crystalx_train.common`: shared utilities
-- `crystalx_train.data_prep`: dataset download, conversion, and label preparation
-- `crystalx_train.models`: model definitions and TorchMD components
-- `crystalx_train.trainers`: training and evaluation entrypoints
-- `crystalx_train.postprocess`: post-training crystallographic processing
+- `crystalx_train.models`: model definitions required by the training scripts
+- `crystalx_train.trainers`: heavy-atom and hydrogen training entrypoints
+- `scripts/train`: shell wrappers for the two trainer modules
 
 ## Entrypoints
 
@@ -35,13 +31,6 @@ training_code/
 - Hydrogen training:
   - `python -m crystalx_train.trainers.trainer_hydro`
   - `sh scripts/train/train_hydro.sh`
-- Data preparation:
-  - `python -m crystalx_train.data_prep.realdata_download`
-  - `python -m crystalx_train.data_prep.process_cif`
-  - `python -m crystalx_train.data_prep.process_hkl`
-- Post-processing:
-  - `python -m crystalx_train.postprocess.SHELXL_process`
-  - `python -m crystalx_train.postprocess.weight_refine`
 
 Run commands from the `training_code` directory so Python can resolve the `crystalx_train` package.
 
@@ -56,15 +45,8 @@ pip install -r requirements.txt
 
 Some PyG-related dependencies may need wheel installation matched to your local PyTorch and CUDA version.
 
-## External Tools
-
-- `SHELXT`
-- `SHELXL`
-- `PLATON`
-
 ## Notes
 
-- Original files in the repository root were not modified during the split.
-- Internal imports were rewritten to package-style imports.
-- Relative data and output paths inside the scripts were intentionally left unchanged in this pass.
+- This repository is intentionally trimmed to only the code path required by `scripts/train/train_heavy.sh` and `scripts/train/train_hydro.sh`.
+- Relative data and output paths inside the trainers were intentionally left unchanged.
 - Legacy training notes are preserved in `README.legacy.md`.
