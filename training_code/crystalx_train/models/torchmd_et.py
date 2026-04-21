@@ -18,7 +18,7 @@ class TorchMD_ET(nn.Module):
 
     Args:
         hidden_channels (int, optional): Hidden embedding size.
-            (default: :obj:`128`)
+            (default: :obj:`512`)
         num_layers (int, optional): The number of attention layers.
             (default: :obj:`6`)
         num_rbf (int, optional): The number of radial basis functions :math:`\mu`.
@@ -54,7 +54,7 @@ class TorchMD_ET(nn.Module):
 
     def __init__(
         self,
-        hidden_channels=256,
+        hidden_channels=512,
         num_layers=8,
         num_rbf=64,
         rbf_type="expnorm",

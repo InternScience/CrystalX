@@ -1,20 +1,38 @@
+"""Prepare SHELXL bond-calculation input files."""
+
+from __future__ import annotations
+
 import argparse
+from dataclasses import dataclass
 
-from crystalx_infer.common.utils import copy_file
+from crystalx_infer.common.paths import BondInputPaths
+from crystalx_infer.common.shelx import copy_file
 
 
-def main(args):
-    hkl_file_path = f"{args.work_dir}/{args.fname}.hkl"
-    res_file_path = f"{args.work_dir}/{args.fname}.res"
-    new_hkl_file_path = f"{args.work_dir}/{args.fname}Bond.hkl"
-    new_res_file_path = f"{args.work_dir}/{args.fname}Bond.ins"
+@dataclass
+class BondInputConfig:
+    fname: str = "sample2_AIhydro"
+    work_dir: str = "work_dir"
 
-    copy_file(hkl_file_path, new_hkl_file_path)
-    copy_file(res_file_path, new_res_file_path)
+
+def run_prepare(config: BondInputConfig) -> None:
+    paths = BondInputPaths.from_values(config.work_dir, config.fname)
+    copy_file(str(paths.source_hkl_path), str(paths.output_hkl_path))
+    copy_file(str(paths.source_res_path), str(paths.output_ins_path))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Prepare SHELXL bond-calculation inputs")
+    parser.add_argument("--fname", type=str, default=BondInputConfig.fname)
+    parser.add_argument("--work_dir", type=str, default=BondInputConfig.work_dir)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    run_prepare(BondInputConfig(**vars(args)))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare SHELXL bond-calculation inputs")
-    parser.add_argument("--fname", type=str, default="sample2_AIhydro", help="file name")
-    parser.add_argument("--work_dir", type=str, default="work_dir", help="work directory")
-    main(parser.parse_args())
+    main()

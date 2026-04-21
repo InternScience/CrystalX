@@ -1,1 +1,1 @@
-"""Shared utilities for CrystalX inference."""
+"""Shared modules for CrystalX inference workflows."""

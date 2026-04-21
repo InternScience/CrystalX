@@ -1,239 +1,93 @@
+"""Heavy-atom evaluation entrypoint for CrystalX inference."""
+
+from __future__ import annotations
+
 import argparse
 import os
-from datetime import datetime
+from dataclasses import dataclass
 
-import numpy as np
 import torch
-import torch.nn.functional as F
-from rdkit import Chem
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
-from tqdm import tqdm
 
-from crystalx_infer.common.utils import cdist, copy_file, update_shelxt
-from crystalx_infer.models.noise_output_model import EquivariantScalar
-from crystalx_infer.models.torchmd_et import TorchMD_ET
-from crystalx_infer.models.torchmd_net import TorchMD_Net
-
-
-def set_seed(seed: int = 42, deterministic_cudnn: bool = False):
-    import random
-
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    if deterministic_cudnn:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+from crystalx_infer.common.checkpoints import HEAVY_CHECKPOINT, resolve_checkpoint_path
+from crystalx_infer.common.chem import atomic_symbol_from_z
+from crystalx_infer.common.datasets import build_heavy_eval_dataset, split_by_year_txt
+from crystalx_infer.common.heavy import run_two_pass_heavy_prediction
+from crystalx_infer.common.modeling import DEFAULT_CHECKPOINT_HIDDEN_CHANNELS, load_torchmd_model
+from crystalx_infer.common.paths import locate_source_case_files, stem_from_pt_path
+from crystalx_infer.common.runtime import get_run_timestamp, resolve_device, set_seed
+from crystalx_infer.common.shelx import copy_file, update_shelxt
 
 
-def get_run_timestamp():
-    try:
-        from zoneinfo import ZoneInfo
+@dataclass
+class HeavyEvalConfig:
+    pt_dir: str
+    txt_path: str
+    model_path: str = HEAVY_CHECKPOINT.filename
+    hf_repo_id: str = ""
+    test_years: tuple[int, ...] = (2018, 2019, 2020, 2021, 2022, 2023, 2024)
+    batch_size: int = 1
+    seed: int = 150
+    device: str = "auto"
+    num_classes: int = 98
+    hidden_channels: int = DEFAULT_CHECKPOINT_HIDDEN_CHANNELS
+    restrict_to_sfac: bool = False
+    allow_one_mismatch: bool = False
+    dump_wrong: bool = False
+    dump_dir: str = ""
+    dump_correct: bool = False
+    dump_correct_dir: str = ""
+    search_roots: tuple[str, ...] = ("all_test_shelx",)
+    cif_root: str = "all_cif"
 
-        now = datetime.now(ZoneInfo("Asia/Singapore"))
-    except Exception:
-        now = datetime.now()
-    return now.strftime("%Y%m%d_%H%M%S")
 
-
-def split_by_year_txt(
-    txt_path: str,
-    pt_dir: str,
-    test_years=(2022, 2023, 2024),
-    pt_prefix="equiv_",
-    pt_suffix=".pt",
-    strict=False,
+def _dump_case(
+    data,
+    predicted,
+    cif_root: str,
+    out_root_dir: str,
+    search_roots: tuple[str, ...],
+    tag: str,
 ):
-    test_years = set(str(y) for y in test_years)
+    from torch_geometric.data import Data
 
-    train_files, test_files = [], []
-    missing = []
-    seen = set()
+    pred_symbols = [atomic_symbol_from_z(int(item)) for item in predicted.detach().cpu().tolist()]
+    fname0 = data.fname[0] if isinstance(data.fname, (list, tuple)) else data.fname
+    stem = stem_from_pt_path(fname0)
+    located = locate_source_case_files(stem, search_roots)
 
-    with open(txt_path, "r", encoding="utf-8") as file_obj:
-        for ln, line in enumerate(file_obj, 1):
-            line = line.strip()
-            if not line:
-                continue
+    out_case_dir = os.path.join(out_root_dir, stem)
+    os.makedirs(out_case_dir, exist_ok=True)
 
-            parts = line.split()
-            if len(parts) < 2:
-                print(f"[WARN] txt line {ln} format error: {line}")
-                continue
+    cif_path = os.path.join(cif_root, f"{stem}.cif")
+    if os.path.exists(cif_path):
+        copy_file(cif_path, os.path.join(out_case_dir, f"{stem}.cif"))
+    else:
+        print(f"[WARN] cif not found: {cif_path}")
 
-            year = parts[0]
-            cif_name = parts[-1]
-            cif_stem = os.path.splitext(os.path.basename(cif_name))[0]
-            pt_path = os.path.join(pt_dir, f"{pt_prefix}{cif_stem}{pt_suffix}")
-
-            if pt_path in seen:
-                continue
-            seen.add(pt_path)
-
-            if not os.path.exists(pt_path):
-                missing.append(pt_path)
-                continue
-
-            if year in test_years:
-                test_files.append(pt_path)
-            else:
-                train_files.append(pt_path)
-
-    if not strict:
-        all_pt = [
-            os.path.join(pt_dir, fn)
-            for fn in os.listdir(pt_dir)
-            if fn.endswith(pt_suffix)
-        ]
-        test_set = set(test_files)
-        listed_set = set(train_files) | test_set
-        extra = [p for p in all_pt if p not in listed_set and p not in test_set]
-        train_files += extra
-
-    return train_files, test_files, missing
-
-
-def build_simple_in_memory_dataset(file_list, is_eval=True, is_check_dist=True):
-    dataset = []
-    dist_error_cnt = 0
-    noise_cnt = 0
-    element_error_cnt = 0
-    cnt = 0
-
-    for fname in tqdm(file_list, desc="Build dataset"):
-        mol_info = torch.load(fname)
-
-        noise = mol_info["noise_list"]
-        if np.max(np.abs(noise)) > 0.1:
-            noise_cnt += 1
-            continue
-
-        z = mol_info["z"]
-        y = mol_info["gt"]
-        z = [item.capitalize() for item in z]
-        y = [item.capitalize() for item in y]
-
+    if located:
+        copy_file(located["hkl"], os.path.join(out_case_dir, f"{stem}_{tag}.hkl"))
+        copy_file(located["res"], os.path.join(out_case_dir, f"{stem}_a.res"))
         try:
-            atomic_z = [Chem.Atom(item).GetAtomicNum() for item in z]
-            y = [Chem.Atom(item).GetAtomicNum() for item in y]
+            update_shelxt(
+                located["res"],
+                os.path.join(out_case_dir, f"{stem}_{tag}.ins"),
+                pred_symbols,
+            )
         except Exception as exc:
-            print("[Element error]", exc, "in", fname)
-            element_error_cnt += 1
-            continue
+            print("[update_shelxt ERROR]", exc)
+            print("[update_shelxt RES]", located["res"])
+    else:
+        print(f"[WARN] Source SHELX case not found for stem={stem}")
 
-        raw_cart = mol_info["pos"]
-        real_cart = []
-        z_num = []
-        for i in range(raw_cart.shape[0]):
-            pos_i = raw_cart[i].tolist()
-            if pos_i not in real_cart:
-                real_cart.append(pos_i)
-                z_num.append(atomic_z[i])
-        real_cart = np.array(real_cart, dtype=np.float32)
-
-        mask = np.zeros(len(z_num), dtype=np.int64)
-        mask[: len(y)] = 1
-        mask = torch.from_numpy(mask).bool()
-
-        if is_check_dist:
-            distance_matrix = cdist(real_cart, real_cart)
-            distance_matrix = distance_matrix + 10 * np.eye(distance_matrix.shape[0])
-            if np.min(distance_matrix) < 0.1:
-                dist_error_cnt += 1
-                continue
-
-        if is_eval:
-            all_z = [sorted(y, reverse=True)]
-        else:
-            all_z = [sorted(y, reverse=True), z_num[: len(y)]]
-
-        y = torch.tensor(y, dtype=torch.long)
-        real_cart = torch.from_numpy(real_cart)
-
-        for pz in all_z:
-            pz = list(pz) + z_num[len(y) :]
-            pz = torch.tensor(pz, dtype=torch.long)
-            dataset.append(Data(z=pz, y=y, pos=real_cart, fname=fname, mask=mask))
-        cnt += 1
-
-    print(
-        f"[Build] kept={cnt} dist_drop={dist_error_cnt} "
-        f"noise_drop={noise_cnt} element_drop={element_error_cnt}"
+    data_cpu = data.to("cpu")
+    torch.save(
+        Data(z=pred_symbols, y=data_cpu.y, pos=data_cpu.pos, fname=str(fname0)),
+        os.path.join(out_case_dir, f"mol_{stem}.pt"),
     )
-    return dataset
 
 
 @torch.no_grad()
-def enforce_coverage_by_prob(prob, sfac, pred):
-    device = pred.device
-    n, k = prob.shape
-    if n == 0 or k == 0 or n < k:
-        return pred
-
-    elem2k = {int(sfac[j].item()): j for j in range(k)}
-    pred_k = torch.tensor(
-        [elem2k[int(x.item())] for x in pred],
-        device=device,
-        dtype=torch.long,
-    )
-    counts = torch.bincount(pred_k, minlength=k).clone()
-    used_atoms = set()
-    missing = (counts == 0).nonzero(as_tuple=False).view(-1).tolist()
-
-    while missing:
-        changed_any = False
-        for miss_k in missing:
-            safe_mask = counts[pred_k] > 1
-
-            if used_atoms:
-                used = torch.zeros(n, device=device, dtype=torch.bool)
-                used[list(used_atoms)] = True
-                safe_mask = safe_mask & (~used)
-
-            if not torch.any(safe_mask):
-                return pred
-
-            target_prob = prob[:, miss_k]
-            cost = (-target_prob).masked_fill(~safe_mask, float("inf"))
-            atom_idx = int(torch.argmin(cost).item())
-
-            old_k = int(pred_k[atom_idx].item())
-            if old_k == miss_k:
-                continue
-
-            pred[atom_idx] = sfac[miss_k]
-            pred_k[atom_idx] = miss_k
-            used_atoms.add(atom_idx)
-            counts[old_k] -= 1
-            counts[miss_k] += 1
-            changed_any = True
-
-        if not changed_any:
-            break
-        missing = (counts == 0).nonzero(as_tuple=False).view(-1).tolist()
-
-    return pred
-
-
-@torch.no_grad()
-def infer_two_pass(
-    model,
-    loader,
-    device,
-    cif_root,
-    restrict_to_sfac=True,
-    allow_one_mismatch=False,
-    dump_wrong=False,
-    dump_dir="infer_bad",
-    dump_correct=False,
-    dump_correct_dir="infer_good",
-    search_roots=None,
-):
+def infer_two_pass(config: HeavyEvalConfig, model, loader, device):
     model.eval()
 
     all_correct_atom = 0
@@ -242,228 +96,177 @@ def infer_two_pass(
     total_mol = 0
     dumped_wrong = 0
     dumped_correct = 0
-    update_fail_stems = []
-    update_fail_set = set()
-    update_fail_cnt = 0
 
-    if dump_wrong:
-        os.makedirs(dump_dir, exist_ok=True)
-    if dump_correct:
-        os.makedirs(dump_correct_dir, exist_ok=True)
+    if config.dump_wrong:
+        os.makedirs(config.dump_dir, exist_ok=True)
+    if config.dump_correct:
+        os.makedirs(config.dump_correct_dir, exist_ok=True)
 
-    def _dump_case(data, pred2, out_root_dir, tag="AI", search_roots=None):
-        nonlocal update_fail_cnt, update_fail_stems, update_fail_set
-
-        pred_sym = [Chem.Atom(int(x.item())).GetSymbol() for x in pred2.detach().cpu()]
-        fname0 = data.fname[0] if isinstance(data.fname, (list, tuple)) else data.fname
-        fname = os.path.basename(fname0)
-        stem = os.path.splitext(fname)[0]
-        stem2 = stem[6:] if stem.startswith("equiv_") else stem
-
-        res_file_path, hkl_file_path = None, None
-        if search_roots is None:
-            search_roots = [
-                "all_xrd_dataset_test",
-                "all_xrd_dataset_test_2",
-                "all_xrd_dataset_test_3",
-                "all_xrd_dataset_test_4",
-            ]
-
-        for root in search_roots:
-            res_candidate = os.path.join(root, stem2, f"{stem2}_a.res")
-            hkl_candidate = os.path.join(root, stem2, f"{stem2}_a.hkl")
-            if os.path.exists(res_candidate) and os.path.exists(hkl_candidate):
-                res_file_path = res_candidate
-                hkl_file_path = hkl_candidate
-                break
-
-        out_case_dir = os.path.join(out_root_dir, stem2)
-        os.makedirs(out_case_dir, exist_ok=True)
-
-        cif_path = os.path.join(cif_root, f"{stem2}.cif")
-        if os.path.exists(cif_path):
-            copy_file(cif_path, os.path.join(out_case_dir, f"{stem2}.cif"))
-        else:
-            print(f"[WARN] cif not found: {cif_path}")
-
-        if hkl_file_path:
-            copy_file(hkl_file_path, os.path.join(out_case_dir, f"{stem2}_{tag}.hkl"))
-
-        if res_file_path:
-            copy_file(res_file_path, os.path.join(out_case_dir, f"{stem2}_a.res"))
-            out_ins = os.path.join(out_case_dir, f"{stem2}_{tag}.ins")
-            try:
-                update_shelxt(res_file_path, out_ins, pred_sym)
-            except Exception as exc:
-                update_fail_cnt += 1
-                if stem2 not in update_fail_set:
-                    update_fail_set.add(stem2)
-                    update_fail_stems.append(stem2)
-                print("[update_shelxt ERROR]", exc)
-                print("[update_shelxt RES]", res_file_path)
-
-        data_cpu = data.to("cpu")
-        fname_save = fname0 if isinstance(fname0, str) else str(fname0)
-        torch.save(
-            Data(z=pred_sym, y=data_cpu.y, pos=data_cpu.pos, fname=fname_save),
-            os.path.join(out_case_dir, f"mol_{stem2}.pt"),
+    for data in loader:
+        data = data.to(device)
+        candidate_elements = torch.unique(data.y) if config.restrict_to_sfac else None
+        _, predicted, _ = run_two_pass_heavy_prediction(
+            model=model,
+            input_z=data.z,
+            pos=data.pos,
+            batch=data.batch,
+            mask=data.mask,
+            candidate_elements=candidate_elements,
+            enforce_element_coverage=config.restrict_to_sfac,
         )
 
-    for data in tqdm(loader, desc="Infer"):
-        data = data.to(device)
-
-        outputs, _ = model(data.z, data.pos, data.batch)
-        logits = outputs
-
-        if restrict_to_sfac:
-            sfac = torch.unique(data.y)
-            logits_sfac = logits[:, sfac]
-            prob = F.softmax(logits_sfac, dim=-1)
-            pred_idx = torch.argmax(prob, dim=1)
-            predicted = sfac[pred_idx]
-        else:
-            prob = F.softmax(logits, dim=-1)
-            predicted = torch.argmax(prob, dim=1)
-
-        outputs2, _ = model(predicted, data.pos, data.batch)
-        logits2 = outputs2[data.mask]
-
-        if restrict_to_sfac:
-            sfac = torch.unique(data.y)
-            logits2_sfac = logits2[:, sfac]
-            prob2 = F.softmax(logits2_sfac, dim=-1)
-            pred_idx2 = torch.argmax(prob2, dim=1)
-            pred2 = sfac[pred_idx2]
-            pred2 = enforce_coverage_by_prob(prob2, sfac, pred2)
-        else:
-            prob2 = F.softmax(logits2, dim=-1)
-            pred2 = torch.argmax(prob2, dim=1)
-
         label = data.y
-        correct_atom = (pred2 == label).sum().item()
-        mol_atom = label.shape[0]
+        correct_atom = int((predicted == label).sum().item())
+        mol_atom = int(label.shape[0])
         all_correct_atom += correct_atom
         total_atom += mol_atom
 
-        ok = (correct_atom == mol_atom) or (
-            allow_one_mismatch and correct_atom == mol_atom - 1
+        is_correct = (correct_atom == mol_atom) or (
+            config.allow_one_mismatch and correct_atom == mol_atom - 1
         )
-
-        if ok:
+        if is_correct:
             correct_mol += 1
-            if dump_correct:
-                _dump_case(data, pred2, dump_correct_dir, tag="AI", search_roots=search_roots)
+            if config.dump_correct:
+                _dump_case(
+                    data=data,
+                    predicted=predicted,
+                    cif_root=config.cif_root,
+                    out_root_dir=config.dump_correct_dir,
+                    search_roots=config.search_roots,
+                    tag="AI",
+                )
                 dumped_correct += 1
-        else:
-            if dump_wrong:
-                _dump_case(data, pred2, dump_dir, tag="AI", search_roots=search_roots)
-                dumped_wrong += 1
+        elif config.dump_wrong:
+            _dump_case(
+                data=data,
+                predicted=predicted,
+                cif_root=config.cif_root,
+                out_root_dir=config.dump_dir,
+                search_roots=config.search_roots,
+                tag="AI",
+            )
+            dumped_wrong += 1
 
         total_mol += 1
 
     atom_acc = all_correct_atom / max(total_atom, 1)
     mol_acc = correct_mol / max(total_mol, 1)
-
-    if dump_wrong:
-        print(f"[Dump] wrong dumped: {dumped_wrong} -> {dump_dir}")
-    if dump_correct:
-        print(f"[Dump] correct dumped: {dumped_correct} -> {dump_correct_dir}")
-
-    print(
-        f"[update_shelxt] fail events: {update_fail_cnt} | unique stems: {len(update_fail_stems)}"
-    )
-
-    if (dump_wrong or dump_correct) and len(update_fail_stems) > 0:
-        root_dir = dump_dir if dump_wrong else dump_correct_dir
-        out_txt = os.path.join(root_dir, "update_shelxt_failed_stems.txt")
-        with open(out_txt, "w", encoding="utf-8") as file_obj:
-            for stem in update_fail_stems:
-                file_obj.write(f"{stem}\n")
-        print("[update_shelxt] failed stem list saved to:", out_txt)
-
-    return atom_acc, mol_acc
+    return atom_acc, mol_acc, dumped_wrong, dumped_correct
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--pt_dir", type=str, required=True)
-    parser.add_argument("--txt_path", type=str, required=True)
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument(
-        "--test_years",
-        type=int,
-        nargs="+",
-        default=[2018, 2019, 2020, 2021, 2022, 2023, 2024],
-    )
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=150)
-    parser.add_argument(
-        "--restrict_to_sfac",
-        action="store_true",
-        help="restrict predictions to the unique ground-truth element set",
-    )
-    parser.add_argument(
-        "--allow_one_mismatch",
-        action="store_true",
-        help="count a structure as correct when exactly one atom is mismatched",
-    )
-    parser.add_argument("--dump_wrong", action="store_true")
-    parser.add_argument("--dump_dir", type=str, default=f"infer_bad_{get_run_timestamp()}")
-    parser.add_argument("--dump_correct", action="store_true")
-    parser.add_argument("--dump_correct_dir", type=str, default=f"infer_good_{get_run_timestamp()}")
-    parser.add_argument("--search_roots", type=str, nargs="*", default=["all_test_shelx"])
-    parser.add_argument("--cif_root", type=str, default="all_cif")
-    args = parser.parse_args()
+def run_evaluation(config: HeavyEvalConfig) -> None:
+    from torch_geometric.loader import DataLoader
 
-    set_seed(args.seed, deterministic_cudnn=False)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    set_seed(config.seed, deterministic_cudnn=False)
+    device = resolve_device(config.device)
     print("Device:", device)
 
+    if config.batch_size != 1 and (config.dump_wrong or config.dump_correct):
+        raise ValueError("batch_size must be 1 when dump_wrong or dump_correct is enabled.")
+
     _, test_files, missing = split_by_year_txt(
-        txt_path=args.txt_path,
-        pt_dir=args.pt_dir,
-        test_years=tuple(args.test_years),
+        txt_path=config.txt_path,
+        pt_dir=config.pt_dir,
+        test_years=config.test_years,
         pt_prefix="equiv_",
         pt_suffix=".pt",
         strict=False,
     )
     print(f"Test files: {len(test_files)} | Missing mapped pt: {len(missing)}")
 
-    test_dataset = build_simple_in_memory_dataset(
+    test_dataset, build_stats = build_heavy_eval_dataset(
         test_files,
         is_eval=True,
         is_check_dist=True,
     )
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    print(f"[Build] {build_stats}")
 
-    rep = TorchMD_ET(attn_activation="silu", num_heads=8, distance_influence="both")
-    out = EquivariantScalar(256, num_classes=98)
-    model = TorchMD_Net(representation_model=rep, output_model=out).to(device)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False)
+    model_path = resolve_checkpoint_path(
+        requested_path=config.model_path,
+        kind="heavy",
+        repo_id=config.hf_repo_id,
+    )
+    model, resolved_num_classes = load_torchmd_model(
+        model_path,
+        device=device,
+        num_classes=config.num_classes,
+        hidden_channels=config.hidden_channels,
+    )
+    print(f"num_classes: {resolved_num_classes} | model_path={model_path}")
 
-    state = torch.load(args.model_path, map_location="cpu")
-    model.load_state_dict(state)
-    model.eval()
-
-    atom_acc, mol_acc = infer_two_pass(
+    atom_acc, mol_acc, dumped_wrong, dumped_correct = infer_two_pass(
+        config=config,
         model=model,
         loader=test_loader,
         device=device,
-        cif_root=args.cif_root,
+    )
+
+    print(f"[{model_path}] Atom Acc: {atom_acc*100:.2f}% | Mol Acc: {mol_acc*100:.2f}%")
+    if config.dump_wrong:
+        print(f"[Dump] wrong dumped: {dumped_wrong} -> {config.dump_dir}")
+    if config.dump_correct:
+        print(f"[Dump] correct dumped: {dumped_correct} -> {config.dump_correct_dir}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    timestamp = get_run_timestamp()
+    parser = argparse.ArgumentParser(description="CrystalX heavy-atom evaluator")
+    parser.add_argument("--pt_dir", type=str, required=True)
+    parser.add_argument("--txt_path", type=str, required=True)
+    parser.add_argument("--model_path", type=str, default=HeavyEvalConfig.model_path)
+    parser.add_argument("--hf_repo_id", type=str, default=HeavyEvalConfig.hf_repo_id)
+    parser.add_argument(
+        "--test_years",
+        type=int,
+        nargs="+",
+        default=list(HeavyEvalConfig.test_years),
+    )
+    parser.add_argument("--batch_size", type=int, default=HeavyEvalConfig.batch_size)
+    parser.add_argument("--seed", type=int, default=HeavyEvalConfig.seed)
+    parser.add_argument("--device", type=str, default=HeavyEvalConfig.device, choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--num_classes", type=int, default=HeavyEvalConfig.num_classes)
+    parser.add_argument(
+        "--hidden_channels",
+        type=int,
+        default=HeavyEvalConfig.hidden_channels,
+        help="Checkpoint hidden width. Use 0 to infer automatically from the checkpoint.",
+    )
+    parser.add_argument("--restrict_to_sfac", action="store_true")
+    parser.add_argument("--allow_one_mismatch", action="store_true")
+    parser.add_argument("--dump_wrong", action="store_true")
+    parser.add_argument("--dump_dir", type=str, default=f"infer_bad_{timestamp}")
+    parser.add_argument("--dump_correct", action="store_true")
+    parser.add_argument("--dump_correct_dir", type=str, default=f"infer_good_{timestamp}")
+    parser.add_argument("--search_roots", type=str, nargs="*", default=list(HeavyEvalConfig.search_roots))
+    parser.add_argument("--cif_root", type=str, default=HeavyEvalConfig.cif_root)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    config = HeavyEvalConfig(
+        pt_dir=args.pt_dir,
+        txt_path=args.txt_path,
+        model_path=args.model_path,
+        hf_repo_id=args.hf_repo_id,
+        test_years=tuple(args.test_years),
+        batch_size=args.batch_size,
+        seed=args.seed,
+        device=args.device,
+        num_classes=args.num_classes,
+        hidden_channels=args.hidden_channels,
         restrict_to_sfac=args.restrict_to_sfac,
         allow_one_mismatch=args.allow_one_mismatch,
         dump_wrong=args.dump_wrong,
         dump_dir=args.dump_dir,
         dump_correct=args.dump_correct,
         dump_correct_dir=args.dump_correct_dir,
-        search_roots=args.search_roots,
+        search_roots=tuple(args.search_roots),
+        cif_root=args.cif_root,
     )
-
-    print(f"[{args.model_path}] Atom Acc: {atom_acc*100:.2f}% | Mol Acc: {mol_acc*100:.2f}%")
-    if args.dump_wrong:
-        print("Dumped wrong cases to:", args.dump_dir)
-    if args.dump_correct:
-        print("Dumped correct cases to:", args.dump_correct_dir)
+    run_evaluation(config)
 
 
 if __name__ == "__main__":

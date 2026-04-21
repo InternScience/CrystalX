@@ -1,298 +1,203 @@
+"""Single-case hydrogen-count prediction entrypoint."""
+
+from __future__ import annotations
+
 import argparse
 import json
-import os
+from dataclasses import dataclass
 
-import numpy as np
-import torch
-import torch.nn.functional as F
-from cctbx.xray.structure import structure
-from iotbx.shelx import crystal_symmetry_from_ins
-from rdkit import Chem
-from scipy.spatial.distance import cdist
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
-from tqdm import tqdm
-
-from crystalx_infer.common.utils import (
-    copy_file,
-    extract_non_numeric_prefix,
+from crystalx_infer.common.checkpoints import HYDRO_CHECKPOINT, resolve_checkpoint_path
+from crystalx_infer.common.hydrogen import (
+    build_graph_from_ins,
+    build_hfix_summary,
+    build_hydro_inputs,
+    compute_alignment_metrics,
     gen_hfix_ins,
-    get_bond,
-    get_equiv_pos2,
-    load_shelxt,
-    load_shelxt_final,
-    update_shelxt_hydro,
+    load_heavy_from_template,
+    load_template_atom_names,
+    predict_hydrogen_counts,
 )
-from crystalx_infer.models.noise_output_model import EquivariantScalar
-from crystalx_infer.models.torchmd_et import TorchMD_ET
-from crystalx_infer.models.torchmd_net import TorchMD_Net
+from crystalx_infer.common.modeling import DEFAULT_CHECKPOINT_HIDDEN_CHANNELS, load_torchmd_model
+from crystalx_infer.common.paths import HydroPredictionPaths
+from crystalx_infer.common.runtime import resolve_device
+from crystalx_infer.common.shelx import copy_file, get_bond, update_shelxt_hydro
 
 
-HIDDEN_CHANNELS = 512
-NUM_CLASSES = 8
-HFIX_HCOUNT = {
-    13: 1,
-    23: 2,
-    43: 1,
-    93: 2,
-    137: 3,
-    147: 1,
-    153: 1,
-    163: 1,
-}
+@dataclass
+class HydroPredictConfig:
+    fname: str = ""
+    work_dir: str = ""
+    res_path: str = ""
+    hkl_path: str = ""
+    model_path: str = HYDRO_CHECKPOINT.filename
+    hf_repo_id: str = ""
+    device: str = "auto"
+    num_classes: int = 8
+    hidden_channels: int = DEFAULT_CHECKPOINT_HIDDEN_CHANNELS
+    topk: int = 5
 
 
-def build_model(model_path, device):
-    representation_model = TorchMD_ET(
-        hidden_channels=HIDDEN_CHANNELS,
-        attn_activation="silu",
-        num_heads=8,
-        distance_influence="both",
-    )
-    output_model = EquivariantScalar(HIDDEN_CHANNELS, num_classes=NUM_CLASSES)
-    model = TorchMD_Net(
-        representation_model=representation_model,
-        output_model=output_model,
-    ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-    return model
+def build_topk_payload(prob, atom_names, predicted_hydrogen_counts, requested_topk):
+    if requested_topk <= 0:
+        raise ValueError("--topk must be >= 1")
 
+    if prob.ndim != 2:
+        raise ValueError(f"Expected 2D probability tensor, got shape={tuple(prob.shape)}")
 
-def build_graph_from_ins(ins_file_path, radius_scale=1.20, min_dist=0.10):
-    frac = []
-    atom_names = []
-
-    try:
-        frac_fvar, atom_names_fvar = load_shelxt_final(
-            ins_file_path,
-            begin_flag="FVAR",
-            is_atom_name=True,
-            is_hydro=False,
-        )
-        if len(atom_names_fvar) > 0:
-            frac = frac_fvar
-            atom_names = atom_names_fvar
-    except Exception:
-        pass
-
-    if len(atom_names) == 0:
-        frac_anis, atom_names_anis, _, _ = load_shelxt(
-            ins_file_path,
-            begin_flag="ANIS",
-            is_atom_name=True,
-        )
-        for point, atom_name in zip(frac_anis, atom_names_anis):
-            atom_symbol = extract_non_numeric_prefix(atom_name).capitalize()
-            if not atom_symbol or atom_symbol == "H":
-                continue
-            frac.append(point)
-            atom_names.append(atom_name)
-
-    filtered = []
-    for point, atom_name in zip(frac, atom_names):
-        atom_symbol = extract_non_numeric_prefix(atom_name).capitalize()
-        if not atom_symbol or atom_symbol == "H":
-            continue
-        filtered.append((point, atom_name, atom_symbol))
-
-    mol_graph = {atom_name: [] for _, atom_name, _ in filtered}
-    if len(filtered) <= 1:
-        return mol_graph
-
-    crystal_symmetry = crystal_symmetry_from_ins.extract_from(ins_file_path)
-    unit_cell = crystal_symmetry.unit_cell()
-    cart = np.array([list(unit_cell.orthogonalize(point)) for point, _, _ in filtered], dtype=np.float64)
-
-    periodic_table = Chem.GetPeriodicTable()
-    radii = []
-    for _, _, atom_symbol in filtered:
-        try:
-            atomic_num = Chem.Atom(atom_symbol).GetAtomicNum()
-            radius = float(periodic_table.GetRcovalent(int(atomic_num)))
-            if radius <= 0:
-                radius = 0.77
-        except Exception:
-            radius = 0.77
-        radii.append(radius)
-
-    for idx_i in range(len(filtered)):
-        for idx_j in range(idx_i + 1, len(filtered)):
-            distance = float(np.linalg.norm(cart[idx_i] - cart[idx_j]))
-            cutoff = (radii[idx_i] + radii[idx_j]) * float(radius_scale)
-            if distance > float(min_dist) and distance <= cutoff:
-                atom_i = filtered[idx_i][1]
-                atom_j = filtered[idx_j][1]
-                mol_graph[atom_i].append(atom_j)
-                mol_graph[atom_j].append(atom_i)
-
-    return mol_graph
-
-
-def load_heavy_from_template(res_file_path, ins_file_path):
-    def load_from_anis(path):
-        frac, atom_names, _, _ = load_shelxt(path, begin_flag="ANIS", is_atom_name=True)
-        real_frac = []
-        shelxt_pred = []
-        for point, atom_name in zip(frac, atom_names):
-            atom_symbol = extract_non_numeric_prefix(atom_name).capitalize()
-            if not atom_symbol or atom_symbol == "H":
-                continue
-            real_frac.append(point)
-            shelxt_pred.append(atom_symbol)
-        return np.array(real_frac), shelxt_pred
-
-    if os.path.exists(res_file_path):
-        real_frac, shelxt_pred = load_shelxt_final(
-            res_file_path,
-            begin_flag="FVAR",
-            is_hydro=False,
-        )
-        if len(shelxt_pred) > 0:
-            return np.array(real_frac), shelxt_pred, res_file_path
-
-        real_frac, shelxt_pred = load_from_anis(res_file_path)
-        if len(shelxt_pred) > 0:
-            return real_frac, shelxt_pred, res_file_path
-
-    real_frac, shelxt_pred = load_from_anis(ins_file_path)
-    return real_frac, shelxt_pred, ins_file_path
-
-
-def build_hydro_inputs(real_frac, shelxt_pred, crystal_structure):
-    real_num = len(shelxt_pred)
-    expanded_cart, expanded_symbols = get_equiv_pos2(
-        np.array(real_frac),
-        shelxt_pred,
-        crystal_structure,
-        radius=3.2,
-    )
-    expanded_z = [Chem.Atom(symbol.capitalize()).GetAtomicNum() for symbol in expanded_symbols]
-
-    if expanded_cart.shape[0] < real_num:
+    prob_cpu = prob.detach().cpu()
+    predicted_cpu = predicted_hydrogen_counts.detach().cpu()
+    atom_count = int(prob_cpu.shape[0])
+    if int(predicted_cpu.shape[0]) != atom_count:
         raise ValueError(
-            f"Expanded positions shorter than heavy atom count: {expanded_cart.shape[0]} < {real_num}"
+            "Hydrogen probability rows do not match predicted labels: "
+            f"prob_rows={atom_count} predicted={int(predicted_cpu.shape[0])}"
+        )
+    if len(atom_names) != atom_count:
+        raise ValueError(
+            "Hydrogen probability rows do not match atom names: "
+            f"prob_rows={atom_count} atom_names={len(atom_names)}"
+        )
+    effective_topk = min(int(requested_topk), int(prob_cpu.shape[1]))
+    topk_prob, topk_idx = prob_cpu.topk(k=effective_topk, dim=1)
+
+    atoms = []
+    for atom_idx in range(atom_count):
+        ranked = []
+        for rank_idx, (prob_value, class_idx) in enumerate(
+            zip(topk_prob[atom_idx].tolist(), topk_idx[atom_idx].tolist()),
+            start=1,
+        ):
+            ranked.append(
+                {
+                    "rank": rank_idx,
+                    "hydrogen_count": int(class_idx),
+                    "probability": float(prob_value),
+                }
+            )
+
+        atoms.append(
+            {
+                "atom_index": atom_idx + 1,
+                "atom_name": atom_names[atom_idx],
+                "predicted_hydrogen_count": int(predicted_cpu[atom_idx].item()),
+                "topk": ranked,
+            }
         )
 
-    real_cart = [row.tolist() for row in expanded_cart[:real_num]]
-    z = [int(value) for value in expanded_z[:real_num]]
-    for idx in range(real_num, expanded_cart.shape[0]):
-        position = expanded_cart[idx].tolist()
-        if position not in real_cart:
-            real_cart.append(position)
-            z.append(int(expanded_z[idx]))
-
-    return real_num, real_cart, z
+    return {
+        "fname": None,
+        "requested_topk": int(requested_topk),
+        "effective_topk": int(effective_topk),
+        "atoms": atoms,
+    }
 
 
-def compute_alignment_metrics(real_frac, real_cart, crystal_structure):
-    unit_cell = crystal_structure.crystal_symmetry().unit_cell()
-    ref_main_cart = np.array([list(unit_cell.orthogonalize(point)) for point in real_frac], dtype=np.float64)
-    used_main_cart = np.array(real_cart[: len(real_frac)], dtype=np.float64)
-    max_abs = float(np.max(np.abs(ref_main_cart - used_main_cart)))
-    return bool(max_abs < 1e-8), max_abs
+def run_prediction(config: HydroPredictConfig) -> None:
+    import numpy as np
+    import torch
+    from cctbx.xray.structure import structure
+    from iotbx.shelx import crystal_symmetry_from_ins
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+    from tqdm import tqdm
 
-
-def load_template_atom_names(template_path):
-    try:
-        _, atom_names = load_shelxt_final(
-            template_path,
-            begin_flag="FVAR",
-            is_atom_name=True,
-            is_hydro=False,
-        )
-        if len(atom_names) > 0:
-            return atom_names
-    except Exception:
-        pass
-
-    frac_tmp, atom_names_tmp, _, _ = load_shelxt(
-        template_path,
-        begin_flag="ANIS",
-        is_atom_name=True,
+    device = resolve_device(config.device)
+    paths = HydroPredictionPaths.from_values(
+        work_dir=config.work_dir,
+        fname=config.fname,
+        res_path=config.res_path,
+        hkl_path=config.hkl_path,
     )
-    filtered_atom_names = []
-    for _, atom_name in zip(frac_tmp, atom_names_tmp):
-        if extract_non_numeric_prefix(atom_name).upper() != "H":
-            filtered_atom_names.append(atom_name)
-    return filtered_atom_names
-
-
-def build_hfix_summary(hfix_ins):
-    hfix_total_h = 0
-    for line in hfix_ins:
-        parts = line.strip().split()
-        if len(parts) < 3 or parts[0] != "HFIX":
-            continue
-        try:
-            code = int(parts[1])
-        except Exception:
-            continue
-        hfix_total_h += int(HFIX_HCOUNT.get(code, 0)) * int(len(parts) - 2)
-    return hfix_total_h
-
-
-def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    ins_file_path = f"{args.work_dir}/{args.fname}.ins"
-    hkl_file_path = f"{args.work_dir}/{args.fname}.hkl"
-    lst_file_path = f"{args.work_dir}/{args.fname}Bond.lst"
-    res_file_path = f"{args.work_dir}/{args.fname}.res"
-    new_res_file_path = f"{args.work_dir}/{args.fname}hydro.ins"
-    new_hkl_file_path = f"{args.work_dir}/{args.fname}hydro.hkl"
-    pred_summary_path = f"{args.work_dir}/{args.fname}_hydro_pred.json"
+    if config.topk <= 0:
+        raise ValueError("--topk must be >= 1")
+    if not paths.res_file_path.exists() and not paths.ins_file_path.exists():
+        raise FileNotFoundError(
+            f"Hydro input template not found: res={paths.res_file_path} ins={paths.ins_file_path}"
+        )
 
     real_frac, shelxt_pred, sym_src_path = load_heavy_from_template(
-        res_file_path=res_file_path,
-        ins_file_path=ins_file_path,
+        res_file_path=str(paths.res_file_path),
+        ins_file_path=str(paths.ins_file_path),
     )
-    print(shelxt_pred)
+    if len(shelxt_pred) == 0:
+        raise ValueError(f"No heavy-atom rows found in hydro template: {sym_src_path}")
 
     crystal_symmetry = crystal_symmetry_from_ins.extract_from(sym_src_path)
     crystal_structure = structure(crystal_symmetry=crystal_symmetry)
-
     real_num, real_cart, z = build_hydro_inputs(real_frac, shelxt_pred, crystal_structure)
-    main_align_ok, main_align_max_abs = compute_alignment_metrics(real_frac, real_cart, crystal_structure)
+    main_align_ok, main_align_max_abs = compute_alignment_metrics(
+        real_frac,
+        real_cart,
+        crystal_structure,
+    )
 
     mask = torch.zeros(len(z), dtype=torch.bool)
     mask[: len(shelxt_pred)] = True
-
     test_loader = DataLoader(
-        [Data(z=torch.tensor(z), pos=torch.from_numpy(np.array(real_cart, dtype=np.float32)), mask=mask)],
+        [
+            Data(
+                z=torch.tensor(z, dtype=torch.long),
+                pos=torch.from_numpy(np.array(real_cart, dtype=np.float32)),
+                mask=mask,
+            )
+        ],
         batch_size=1,
         shuffle=False,
     )
-    model = build_model(args.model_path, device)
 
+    model_path = resolve_checkpoint_path(
+        requested_path=config.model_path,
+        kind="hydro",
+        repo_id=config.hf_repo_id,
+    )
+    model, resolved_num_classes = load_torchmd_model(
+        model_path,
+        device=device,
+        num_classes=config.num_classes,
+        hidden_channels=config.hidden_channels,
+    )
+    print(f"[INFO] device={device} num_classes={resolved_num_classes} model={model_path}")
+
+    prob = None
     predicted = None
     with torch.inference_mode():
-        for data in tqdm(test_loader):
+        for data in tqdm(test_loader, desc="Predict hydro"):
             data = data.to(device)
-            logits = model(data.z, data.pos, data.batch)
-            logits = F.softmax(logits[data.mask], dim=-1)
-            predicted = torch.argmax(logits, dim=1).to("cpu")
-            print(predicted)
+            prob, predicted = predict_hydrogen_counts(
+                model=model,
+                input_z=data.z,
+                pos=data.pos,
+                batch=data.batch,
+                mask=data.mask,
+            )
+            predicted = predicted.to("cpu")
 
+    if prob is None or predicted is None:
+        raise RuntimeError("Hydrogen prediction did not produce probability outputs.")
     pred_h_per_atom = [int(value) for value in predicted.tolist()]
     pred_h_total = int(sum(pred_h_per_atom))
 
     mol_graph = None
     used_lst = ""
-    for candidate in [lst_file_path, f"{args.work_dir}/{args.fname}.lst"]:
-        if os.path.exists(candidate):
-            mol_graph = get_bond(candidate)
-            used_lst = candidate
+    for candidate in paths.lst_candidates:
+        if candidate.exists():
+            mol_graph = get_bond(str(candidate))
+            used_lst = str(candidate)
             break
 
     if mol_graph is None:
-        print("[WARN] No .lst found for bond table, fallback to distance-based connectivity.")
-        template_for_graph = res_file_path if os.path.exists(res_file_path) else ins_file_path
+        template_for_graph = (
+            str(paths.res_file_path) if paths.res_file_path.exists() else str(paths.ins_file_path)
+        )
+        print(
+            "[WARN] No .lst found for bond table, fallback to RDKit covalent-radius "
+            "connectivity: bond if distance <= (r_i + r_j) * 1.20 and distance > 0.10 A."
+        )
         mol_graph = build_graph_from_ins(template_for_graph)
     else:
         print(f"[INFO] Bond table from: {used_lst}")
 
-    template_path = res_file_path if os.path.exists(res_file_path) else ins_file_path
+    template_path = str(paths.res_file_path) if paths.res_file_path.exists() else str(paths.ins_file_path)
     atom_names_in_template = load_template_atom_names(template_path)
     for atom_name in atom_names_in_template:
         mol_graph.setdefault(atom_name, [])
@@ -305,13 +210,24 @@ def main(args):
             f"(template={template_path})"
         )
 
-    copy_file(hkl_file_path, new_hkl_file_path)
     hfix_ins = gen_hfix_ins(template_path, mol_graph, predicted)
-    update_shelxt_hydro(template_path, new_res_file_path, hfix_ins)
+    update_shelxt_hydro(template_path, str(paths.output_ins_path), hfix_ins)
+    if paths.hkl_input_path is not None:
+        copy_file(str(paths.hkl_input_path), str(paths.output_hkl_path))
+
+    topk_payload = build_topk_payload(
+        prob=prob,
+        atom_names=atom_names_in_template,
+        predicted_hydrogen_counts=predicted,
+        requested_topk=config.topk,
+    )
+    topk_payload["fname"] = paths.output_stem
+    with open(paths.topk_path, "w", encoding="utf-8") as file_obj:
+        json.dump(topk_payload, file_obj, indent=2)
 
     hfix_total_h = build_hfix_summary(hfix_ins)
     pred_summary = {
-        "fname": args.fname,
+        "fname": paths.output_stem,
         "pred_h_total": pred_h_total,
         "pred_h_per_atom": pred_h_per_atom,
         "pred_atom_count": int(len(pred_h_per_atom)),
@@ -321,11 +237,19 @@ def main(args):
         "hfix_line_count": int(len(hfix_ins)),
         "hfix_total_h": int(hfix_total_h),
         "pred_vs_hfix_match": bool(int(pred_h_total) == int(hfix_total_h)),
+        "topk_json": paths.topk_path.name,
+        "requested_topk": int(config.topk),
+        "effective_topk": int(topk_payload["effective_topk"]),
     }
-    with open(pred_summary_path, "w", encoding="utf-8") as file_obj:
-        json.dump(pred_summary, file_obj)
+    with open(paths.summary_path, "w", encoding="utf-8") as file_obj:
+        json.dump(pred_summary, file_obj, indent=2)
 
-    print(f"[INFO] Saved hydro prediction summary: {pred_summary_path}")
+    if paths.hkl_input_path is not None:
+        print(f"[INFO] Copied hydro HKL: {paths.output_hkl_path.name}")
+    else:
+        print("[INFO] No HKL input provided; skipped writing hydro.hkl output.")
+    print(f"[INFO] Saved hydro prediction summary: {paths.summary_path.name}")
+    print(f"[INFO] Saved hydro top-k probabilities: {paths.topk_path.name}")
     print(f"[INFO] Predicted total H: {pred_h_total}")
     print(
         f"[INFO] HFIX implied total H: {pred_summary['hfix_total_h']} | "
@@ -335,17 +259,63 @@ def main(args):
         f"[INFO] Coord align check: ok={pred_summary['coord_align_ok']} "
         f"max_abs_diff={pred_summary['coord_align_max_abs_diff']:.3e}"
     )
-    print(predicted)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "CrystalX hydrogen-count predictor. Use --res_path for standalone .res input, "
+            "or keep --fname/--work_dir for the legacy naming convention."
+        )
+    )
+    parser.add_argument(
+        "--fname",
+        type=str,
+        default=HydroPredictConfig.fname,
+        help="Output stem. In legacy mode this is the case prefix; in --res_path mode it overrides the derived stem.",
+    )
+    parser.add_argument(
+        "--work_dir",
+        type=str,
+        default=HydroPredictConfig.work_dir,
+        help="Legacy case directory, or output directory when --res_path is used.",
+    )
+    parser.add_argument(
+        "--res_path",
+        type=str,
+        default=HydroPredictConfig.res_path,
+        help="Standalone hydro-stage input .res path. When set, the predictor reads heavy atoms and symmetry directly from this file.",
+    )
+    parser.add_argument(
+        "--hkl_path",
+        type=str,
+        default=HydroPredictConfig.hkl_path,
+        help="Optional .hkl paired with --res_path. When provided, it is copied to the hydro output.",
+    )
+    parser.add_argument("--model_path", type=str, default=HydroPredictConfig.model_path)
+    parser.add_argument("--hf_repo_id", type=str, default=HydroPredictConfig.hf_repo_id)
+    parser.add_argument("--device", type=str, default=HydroPredictConfig.device, choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--num_classes", type=int, default=HydroPredictConfig.num_classes)
+    parser.add_argument(
+        "--hidden_channels",
+        type=int,
+        default=HydroPredictConfig.hidden_channels,
+        help="Checkpoint hidden width. Use 0 to infer automatically from the checkpoint.",
+    )
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=HydroPredictConfig.topk,
+        help="How many highest-probability classes to save per atom in the JSON report.",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    run_prediction(HydroPredictConfig(**vars(args)))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Hydro Handler")
-    parser.add_argument("--fname", type=str, default="sample2_AI", help="file name")
-    parser.add_argument("--work_dir", type=str, default="work_dir", help="work directory")
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default="final_hydro_model_add_no_noise_fold_3.pth",
-        help="model path",
-    )
-    main(parser.parse_args())
+    main()

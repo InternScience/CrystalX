@@ -1,13 +1,17 @@
+"""Write final CrystalX structure bundles and metrics."""
+
+from __future__ import annotations
+
 import argparse
-import json
-import os
-import zipfile
 from collections import Counter
+import json
+from pathlib import Path
+import zipfile
+from dataclasses import dataclass
 
-from cctbx.xray.structure import structure
-from iotbx.shelx import crystal_symmetry_from_ins
-
-from crystalx_infer.common.utils import (
+from crystalx_infer.common.chem import build_formula
+from crystalx_infer.common.paths import FinalOutputPaths
+from crystalx_infer.common.shelx import (
     copy_file,
     get_R2,
     load_shelxt_final,
@@ -16,11 +20,10 @@ from crystalx_infer.common.utils import (
 )
 
 
-def build_formula(atom_symbols):
-    formula = ""
-    for symbol, count in Counter(atom_symbols).items():
-        formula += f"{symbol}{count}"
-    return formula
+@dataclass
+class FinalOutputConfig:
+    fname: str = "sample2_AIhydroWeight"
+    work_dir: str = "work_dir"
 
 
 def write_xyz(xyz_save_path, atom_symbols, real_cart, formula):
@@ -34,95 +37,103 @@ def write_xyz(xyz_save_path, atom_symbols, real_cart, formula):
 def write_gjf(gjf_save_path, atom_symbols, real_cart, formula):
     with open(gjf_save_path, "w", encoding="utf-8") as file_obj:
         file_obj.write("%chk=11.chk\n")
-        file_obj.write("#opt freq pm6\n")
-        file_obj.write("\n")
-        file_obj.write(f"Title {formula}\n")
-        file_obj.write("\n")
+        file_obj.write("#opt freq pm6\n\n")
+        file_obj.write(f"Title {formula}\n\n")
         file_obj.write("0 1\n")
         for atom, coord in zip(atom_symbols, real_cart):
             file_obj.write(f"{atom} {coord[0]} {coord[1]} {coord[2]}\n")
 
 
-def main(args):
-    qpeak_res_name = f"{args.work_dir}/{args.fname}.res"
-    hkl_file_path = f"{args.work_dir}/{args.fname}.hkl"
-    cif_file_path = f"{args.work_dir}/{args.fname}.cif"
-    chk_file_path = f"{args.work_dir}/{args.fname}.chk"
+def run_write(config: FinalOutputConfig) -> None:
+    from cctbx.xray.structure import structure
+    from iotbx.shelx import crystal_symmetry_from_ins
 
-    final_qpeak_res_name = f"{args.work_dir}/{args.fname}Final.ins"
-    new_hkl_file_path = f"{args.work_dir}/{args.fname}Final.hkl"
-    new_cif_file_path = f"{args.work_dir}/{args.fname}Final.cif"
-    xyz_save_path = f"{args.work_dir}/{args.fname}Final.xyz"
-    gjf_save_path = f"{args.work_dir}/{args.fname}Final.gjf"
-    metrics_save_path = f"{args.work_dir}/{args.fname}FinalMetrics.json"
-    zip_save_path = f"{args.work_dir}/{args.fname}Final.zip"
-    new_chk_file_path = f"{args.work_dir}/{args.fname}Final_checkcif.chk"
+    paths = FinalOutputPaths.from_values(config.work_dir, config.fname)
+    source_res = paths.source_res_path
+    is_structure_valid = False
+    is_quality_valid = False
 
-    if os.path.getsize(qpeak_res_name) == 0:
-        qpeak_res_name = f"{args.work_dir}/{args.fname[:-6]}.res"
-        is_structure_valid = False
-        is_quality_valid = False
-        zip_list = [final_qpeak_res_name, new_hkl_file_path, xyz_save_path, gjf_save_path]
-    else:
-        os.rename(chk_file_path, new_chk_file_path)
-        is_structure_valid, is_quality_valid = read_checkcif(new_chk_file_path)
+    if (not source_res.exists() or source_res.stat().st_size == 0) and paths.fallback_res_path.exists():
+        source_res = paths.fallback_res_path
         zip_list = [
-            final_qpeak_res_name,
-            new_hkl_file_path,
-            new_cif_file_path,
-            xyz_save_path,
-            gjf_save_path,
-            new_chk_file_path,
+            str(paths.final_ins_path),
+            str(paths.final_hkl_path),
+            str(paths.final_xyz_path),
+            str(paths.final_gjf_path),
+        ]
+    else:
+        if paths.source_chk_path.exists():
+            paths.source_chk_path.replace(paths.final_chk_path)
+            is_structure_valid, is_quality_valid = read_checkcif(str(paths.final_chk_path))
+        zip_list = [
+            str(paths.final_ins_path),
+            str(paths.final_hkl_path),
+            str(paths.final_cif_path),
+            str(paths.final_xyz_path),
+            str(paths.final_gjf_path),
+            str(paths.final_chk_path),
         ]
 
-    real_frac, shelxt_pred = load_shelxt_final(qpeak_res_name, begin_flag="FVAR")
-    shelxt_pred = [item.capitalize() for item in shelxt_pred]
-    print(shelxt_pred)
+    real_frac, atom_symbols = load_shelxt_final(str(source_res), begin_flag="FVAR")
+    atom_symbols = [item.capitalize() for item in atom_symbols]
+    formula = build_formula(atom_symbols)
 
-    formula = build_formula(shelxt_pred)
-    update_shelxt_final(qpeak_res_name, final_qpeak_res_name, dict(Counter(shelxt_pred)), no_given_sfac=True)
-    copy_file(hkl_file_path, new_hkl_file_path)
-    copy_file(cif_file_path, new_cif_file_path)
+    update_shelxt_final(
+        str(source_res),
+        str(paths.final_ins_path),
+        dict(Counter(atom_symbols)),
+        no_given_sfac=True,
+    )
+    copy_file(str(paths.source_hkl_path), str(paths.final_hkl_path))
+    if paths.source_cif_path.exists():
+        copy_file(str(paths.source_cif_path), str(paths.final_cif_path))
 
-    crystal_symmetry = crystal_symmetry_from_ins.extract_from(qpeak_res_name)
+    crystal_symmetry = crystal_symmetry_from_ins.extract_from(str(source_res))
     crystal_structure = structure(crystal_symmetry=crystal_symmetry)
     unit_cell = crystal_structure.crystal_symmetry().unit_cell()
     real_cart = [list(unit_cell.orthogonalize(point)) for point in real_frac]
 
-    write_xyz(xyz_save_path, shelxt_pred, real_cart, formula)
-    write_gjf(gjf_save_path, shelxt_pred, real_cart, formula)
+    write_xyz(str(paths.final_xyz_path), atom_symbols, real_cart, formula)
+    write_gjf(str(paths.final_gjf_path), atom_symbols, real_cart, formula)
 
-    with zipfile.ZipFile(zip_save_path, "w") as zip_obj:
+    with zipfile.ZipFile(paths.final_zip_path, "w") as zip_obj:
         for path in zip_list:
-            zip_obj.write(path)
+            if path and Path(path).exists():
+                zip_obj.write(path)
 
-    wr2, r1, goof, q1 = get_R2(qpeak_res_name)
+    wr2, r1, goof, q1 = get_R2(str(source_res))
     fitting_metrics = {
         "wr2": wr2,
         "r1": r1,
         "goof": goof,
         "q1": q1,
+        "formula": formula,
         "formular": formula,
         "is_structure_valid": is_structure_valid,
         "is_quality_valid": is_quality_valid,
+        "structure_mes": (
+            "Stucture valid!"
+            if is_structure_valid
+            else "Slight structural flaws, possibly due to disorder or the ambiguity of hydrogen atom positions."
+        ),
+        "quality_mes": "Reflections valid!" if is_quality_valid else "May need reflection correction",
     }
-    if is_structure_valid:
-        fitting_metrics["structure_mes"] = "Stucture valid!"
-    else:
-        fitting_metrics["structure_mes"] = (
-            "Slight structural flaws, possibly due to disorder or the ambiguity of hydrogen atom positions."
-        )
-    if is_quality_valid:
-        fitting_metrics["quality_mes"] = "Reflections valid!"
-    else:
-        fitting_metrics["quality_mes"] = "May need reflection correction"
-
-    with open(metrics_save_path, "w", encoding="utf-8") as file_obj:
+    with open(paths.final_metrics_path, "w", encoding="utf-8") as file_obj:
         json.dump(fitting_metrics, file_obj)
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Write final XYZ/GJF/metrics bundle")
-    parser.add_argument("--fname", type=str, default="sample2_AIhydroWeight", help="file name")
-    parser.add_argument("--work_dir", type=str, default="work_dir", help="work directory")
-    main(parser.parse_args())
+    parser.add_argument("--fname", type=str, default=FinalOutputConfig.fname)
+    parser.add_argument("--work_dir", type=str, default=FinalOutputConfig.work_dir)
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    run_write(FinalOutputConfig(**vars(args)))
+
+
+if __name__ == "__main__":
+    main()

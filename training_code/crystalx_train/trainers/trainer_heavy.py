@@ -1,200 +1,162 @@
-import json
+from __future__ import annotations
+
+import argparse
 import math
-import os
-import random
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from rdkit import Chem
-from scipy.spatial.distance import cdist
 from torch.optim.lr_scheduler import LambdaLR
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-from crystalx_train.models.noise_output_model import EquivariantScalar
-from crystalx_train.models.torchmd_et import TorchMD_ET
-from crystalx_train.models.torchmd_net import TorchMD_Net
+from crystalx_train.common import (
+    EvalMetrics,
+    RepresentationConfig,
+    SplitSpec,
+    build_model,
+    deduplicate_positions,
+    get_run_timestamp,
+    is_distance_valid,
+    preview_missing_files,
+    resolve_device,
+    set_seed,
+    split_by_year_txt,
+    symbols_to_atomic_numbers,
+    to_serializable,
+    write_hparams,
+    write_log_header,
+)
 
 
-DEVICE = torch.device("cuda")
-print(DEVICE)
+DEFAULT_PT_DIR = "/inspire/ssd/project/project-public/zhengkaipeng-240108120123/all_materials/data/all_anno_density"
+DEFAULT_TXT_PATH = "sorted_by_journal_year.txt"
+DEFAULT_TEST_YEARS = (2018, 2019, 2020, 2021, 2022, 2023, 2024)
 
 
-def set_seed(seed: int = 42, deterministic_cudnn: bool = False):
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-
-    if deterministic_cudnn:
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
-def get_run_timestamp():
-    try:
-        from zoneinfo import ZoneInfo
-
-        now = datetime.now(ZoneInfo("Asia/Singapore"))
-    except Exception:
-        now = datetime.now()
-    return now.strftime("%Y%m%d_%H%M%S")
-
-
-def split_by_year_txt(
-    txt_path: str,
-    pt_dir: str,
-    test_years=(2022, 2023, 2024),
-    pt_prefix="equiv_",
-    pt_suffix=".pt",
-    strict=False,
-):
-    test_years = {str(year) for year in test_years}
-    train_files, test_files, missing = [], [], []
-    seen = set()
-
-    with open(txt_path, "r", encoding="utf-8") as file_obj:
-        for line_num, line in enumerate(file_obj, 1):
-            line = line.strip()
-            if not line:
-                continue
-
-            parts = line.split()
-            if len(parts) < 2:
-                print(f"[WARN] malformed line {line_num} in {txt_path}: {line}")
-                continue
-
-            year = parts[0]
-            cif_stem = os.path.splitext(os.path.basename(parts[-1]))[0]
-            pt_path = os.path.join(pt_dir, f"{pt_prefix}{cif_stem}{pt_suffix}")
-
-            if pt_path in seen:
-                continue
-            seen.add(pt_path)
-
-            if not os.path.exists(pt_path):
-                missing.append(pt_path)
-                continue
-
-            if year in test_years:
-                test_files.append(pt_path)
-            else:
-                train_files.append(pt_path)
-
-    if not strict:
-        listed_files = set(train_files) | set(test_files)
-        extra_train_files = [
-            os.path.join(pt_dir, file_name)
-            for file_name in os.listdir(pt_dir)
-            if file_name.endswith(pt_suffix) and os.path.join(pt_dir, file_name) not in listed_files
-        ]
-        train_files.extend(extra_train_files)
-
-    return train_files, test_files, missing
+@dataclass(frozen=True)
+class HeavyTrainingConfig:
+    seed: int = 150
+    deterministic_cudnn: bool = False
+    device: str = "auto"
+    pt_dir: str = DEFAULT_PT_DIR
+    txt_path: str = DEFAULT_TXT_PATH
+    test_years: tuple[int, ...] = DEFAULT_TEST_YEARS
+    pt_prefix: str = "equiv_"
+    pt_suffix: str = ".pt"
+    strict: bool = False
+    check_dist: bool = True
+    learning_rate: float = 1e-4
+    beta1: float = 0.9
+    beta2: float = 0.999
+    epsilon: float = 1e-8
+    weight_decay: float = 1e-2
+    epochs: int = 100
+    warmup_epochs: int = 0
+    min_lr: float = 0.0
+    validation_interval: int = 500
+    batch_size_train: int = 16
+    batch_size_test: int = 1
+    num_classes: int = 98
+    hidden_channels: int = 512
+    attn_activation: str = "silu"
+    num_heads: int = 8
+    distance_influence: str = "both"
+    metric_log_path: str | None = None
+    model_save_name: str | None = None
+    load_model_path: str | None = None
 
 
-def _deduplicate_positions(atom_numbers, positions):
-    unique_pos = []
-    unique_atoms = []
+def build_heavy_dataset(
+    file_list: list[str],
+    *,
+    is_eval: bool,
+    check_dist: bool,
+) -> tuple[list[Data], float, dict[str, int]]:
+    from torch_geometric.data import Data
 
-    for idx in range(positions.shape[0]):
-        position = positions[idx].tolist()
-        if position not in unique_pos:
-            unique_pos.append(position)
-            unique_atoms.append(atom_numbers[idx])
-
-    return unique_atoms, np.asarray(unique_pos, dtype=np.float32)
-
-
-def _is_distance_valid(real_cart):
-    distance_matrix = cdist(real_cart, real_cart) + 10 * np.eye(real_cart.shape[0])
-    return np.min(distance_matrix) >= 0.1
-
-
-def build_simple_in_memory_dataset(file_list, is_eval=False, is_check_dist=True):
-    dataset = []
+    dataset: list[Data] = []
     correct_mol = 0
     total_mol = 0
-    dist_error_cnt = 0
-    noise_cnt = 0
-    element_error_cnt = 0
-    sample_cnt = 0
+    stats = {
+        "kept_samples": 0,
+        "dataset_records": 0,
+        "dist_drop": 0,
+        "noise_drop": 0,
+        "element_drop": 0,
+        "missing_key_drop": 0,
+    }
+    required_keys = {"z", "gt", "pos"}
 
-    for fname in tqdm(file_list):
+    desc = "Build heavy eval dataset" if is_eval else "Build heavy train dataset"
+    for fname in tqdm(file_list, desc=desc):
         mol_info = torch.load(fname)
-
-        noise = mol_info["noise_list"]
-        if np.max(np.abs(noise)) > 0.1:
-            noise_cnt += 1
+        if not required_keys.issubset(mol_info.keys()):
+            stats["missing_key_drop"] += 1
             continue
+
+        if "noise_list" in mol_info:
+            noise = np.asarray(mol_info["noise_list"])
+            if noise.size > 0 and float(np.max(np.abs(noise))) > 0.1:
+                stats["noise_drop"] += 1
+                continue
 
         atom_symbols = [item.capitalize() for item in mol_info["z"]]
         label_symbols = [item.capitalize() for item in mol_info["gt"]]
         try:
-            atom_numbers = [Chem.Atom(item).GetAtomicNum() for item in atom_symbols]
-            label_numbers = [Chem.Atom(item).GetAtomicNum() for item in label_symbols]
+            atom_numbers = symbols_to_atomic_numbers(atom_symbols)
+            label_numbers = symbols_to_atomic_numbers(label_symbols)
         except Exception:
-            element_error_cnt += 1
+            stats["element_drop"] += 1
             continue
 
-        unique_atoms, real_cart = _deduplicate_positions(atom_numbers, mol_info["pos"])
+        if not label_numbers:
+            stats["missing_key_drop"] += 1
+            continue
+
+        unique_atoms, real_cart = deduplicate_positions(atom_numbers, mol_info["pos"])
         mask = torch.zeros(len(unique_atoms), dtype=torch.bool)
         mask[: len(label_numbers)] = True
 
-        if is_check_dist and not _is_distance_valid(real_cart):
-            dist_error_cnt += 1
+        if check_dist and not is_distance_valid(real_cart):
+            stats["dist_drop"] += 1
             continue
 
-        label = torch.tensor(label_numbers)
-        candidate_atoms = [sorted(label_numbers, reverse=True)]
+        label = torch.tensor(label_numbers, dtype=torch.long)
+        candidate_inputs = [sorted(label_numbers, reverse=True)]
         if not is_eval:
-            candidate_atoms.append(unique_atoms[: len(label_numbers)])
+            candidate_inputs.append(unique_atoms[: len(label_numbers)])
 
-        current_atoms = torch.tensor(unique_atoms)
-        correct_atom = (current_atoms[mask] == label).sum().item()
-        if correct_atom == label.shape[0]:
+        current_atoms = torch.tensor(unique_atoms, dtype=torch.long)
+        if bool(torch.equal(current_atoms[mask], label)):
             correct_mol += 1
         total_mol += 1
 
         real_cart_tensor = torch.from_numpy(real_cart)
-        trailing_atoms = unique_atoms[len(label_numbers):]
-        for atoms in candidate_atoms:
+        trailing_atoms = unique_atoms[len(label_numbers) :]
+        for atoms in candidate_inputs:
             dataset.append(
                 Data(
-                    z=torch.tensor(atoms + trailing_atoms),
+                    z=torch.tensor(list(atoms) + trailing_atoms, dtype=torch.long),
                     y=label,
                     pos=real_cart_tensor,
-                    fname=fname,
+                    fname=str(fname),
                     mask=mask,
                 )
             )
-        sample_cnt += 1
+
+        stats["kept_samples"] += 1
+        stats["dataset_records"] = len(dataset)
 
     mol_accuracy = correct_mol / total_mol if total_mol > 0 else 0.0
-    print(sample_cnt)
-    print(dist_error_cnt)
-    print(noise_cnt)
-    print(element_error_cnt)
-    return dataset, mol_accuracy
-
-
-def write_hparams(log_f, hparams: dict):
-    log_f.write("---- Hyperparameters ----\n")
-    log_f.write(json.dumps(hparams, indent=2, ensure_ascii=False) + "\n")
-    log_f.write("-------------------------\n\n")
+    return dataset, mol_accuracy, stats
 
 
 @torch.no_grad()
-def enforce_coverage_by_prob(prob, sfac, pred):
+def enforce_coverage_by_prob(prob: torch.Tensor, sfac: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
     num_atoms, num_elements = prob.shape
     if num_atoms == 0 or num_elements == 0 or num_atoms < num_elements:
         return pred
@@ -207,7 +169,7 @@ def enforce_coverage_by_prob(prob, sfac, pred):
     )
 
     counts = torch.bincount(pred_idx, minlength=num_elements).clone()
-    used_atoms = set()
+    used_atoms: set[int] = set()
     missing = (counts == 0).nonzero(as_tuple=False).view(-1).tolist()
 
     while missing:
@@ -246,15 +208,21 @@ def enforce_coverage_by_prob(prob, sfac, pred):
 
 
 @torch.no_grad()
-def eval_two_pass(model, test_loader, allow_one_mismatch=False):
+def evaluate_heavy_two_pass(
+    model: torch.nn.Module,
+    test_loader,
+    *,
+    device: torch.device,
+    allow_one_mismatch: bool,
+) -> EvalMetrics:
     model.eval()
     all_correct_atom = 0
     correct_mol = 0
     total_atom = 0
     total_mol = 0
 
-    for data in tqdm(test_loader):
-        data = data.to(DEVICE)
+    for data in tqdm(test_loader, desc="Eval heavy"):
+        data = data.to(device)
 
         first_pass_logits, _ = model(data.z, data.pos, data.batch)
         sfac = torch.unique(data.y)
@@ -267,8 +235,8 @@ def eval_two_pass(model, test_loader, allow_one_mismatch=False):
         predicted = enforce_coverage_by_prob(masked_prob, sfac, predicted)
 
         label = data.y
-        correct_atom = (predicted == label).sum().item()
-        mol_atom = label.shape[0]
+        correct_atom = int((predicted == label).sum().item())
+        mol_atom = int(label.shape[0])
 
         all_correct_atom += correct_atom
         total_atom += mol_atom
@@ -284,22 +252,16 @@ def eval_two_pass(model, test_loader, allow_one_mismatch=False):
 
     atom_accuracy = all_correct_atom / total_atom if total_atom > 0 else 0.0
     mol_accuracy = correct_mol / total_mol if total_mol > 0 else 0.0
-    return atom_accuracy, mol_accuracy
-
-
-def build_model(rep_hparams, num_classes):
-    representation_model = TorchMD_ET(
-        hidden_channels=rep_hparams["hidden_channels"],
-        attn_activation=rep_hparams["attn_activation"],
-        num_heads=rep_hparams["num_heads"],
-        distance_influence=rep_hparams["distance_influence"],
+    return EvalMetrics(
+        atom_accuracy=atom_accuracy,
+        mol_accuracy=mol_accuracy,
+        total_atoms=total_atom,
+        total_mols=total_mol,
     )
-    output_model = EquivariantScalar(rep_hparams["hidden_channels"], num_classes=num_classes)
-    return TorchMD_Net(representation_model=representation_model, output_model=output_model)
 
 
-def build_lr_lambda(learning_rate, min_lr, warmup_epochs, epochs):
-    def lr_lambda(epoch: int):
+def build_lr_lambda(learning_rate: float, min_lr: float, warmup_epochs: int, epochs: int):
+    def lr_lambda(epoch: int) -> float:
         if warmup_epochs > 0 and epoch < warmup_epochs:
             return float(epoch + 1) / float(warmup_epochs)
         if epochs <= warmup_epochs:
@@ -313,193 +275,308 @@ def build_lr_lambda(learning_rate, min_lr, warmup_epochs, epochs):
     return lr_lambda
 
 
-def write_log_header(log_f, run_ts, test_years, train_size, test_size):
-    log_f.write("==== New Run ====\n")
-    log_f.write(f"Run timestamp: {run_ts}\n")
-    log_f.write(f"Device: {DEVICE}\n\n")
-    log_f.write(f"Test years: {list(test_years)}\n")
-    log_f.write("Train years: all other years\n")
-    log_f.write(f"Train Data: {train_size} | Test Data: {test_size}\n\n")
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train the CrystalX heavy-atom classifier.")
+
+    runtime_group = parser.add_argument_group("runtime")
+    runtime_group.add_argument("--seed", type=int, default=150)
+    runtime_group.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    runtime_group.add_argument("--deterministic_cudnn", action="store_true")
+
+    data_group = parser.add_argument_group("data")
+    data_group.add_argument("--pt_dir", type=str, default=DEFAULT_PT_DIR)
+    data_group.add_argument("--txt_path", type=str, default=DEFAULT_TXT_PATH)
+    data_group.add_argument("--test_years", type=int, nargs="+", default=list(DEFAULT_TEST_YEARS))
+    data_group.add_argument("--pt_prefix", type=str, default="equiv_")
+    data_group.add_argument("--pt_suffix", type=str, default=".pt")
+    data_group.add_argument("--strict", action="store_true")
+    data_group.add_argument("--no_dist_check", action="store_true")
+
+    optimization_group = parser.add_argument_group("optimization")
+    optimization_group.add_argument("--learning_rate", type=float, default=1e-4)
+    optimization_group.add_argument("--beta1", type=float, default=0.9)
+    optimization_group.add_argument("--beta2", type=float, default=0.999)
+    optimization_group.add_argument("--epsilon", type=float, default=1e-8)
+    optimization_group.add_argument("--weight_decay", type=float, default=1e-2)
+    optimization_group.add_argument("--epochs", type=int, default=100)
+    optimization_group.add_argument("--warmup_epochs", type=int, default=0)
+    optimization_group.add_argument("--min_lr", type=float, default=0.0)
+    optimization_group.add_argument("--validation_interval", type=int, default=500)
+    optimization_group.add_argument("--batch_size_train", type=int, default=16)
+    optimization_group.add_argument("--batch_size_test", type=int, default=1)
+
+    model_group = parser.add_argument_group("model")
+    model_group.add_argument("--num_classes", type=int, default=98)
+    model_group.add_argument("--hidden_channels", type=int, default=512)
+    model_group.add_argument("--attn_activation", type=str, default="silu")
+    model_group.add_argument("--num_heads", type=int, default=8)
+    model_group.add_argument("--distance_influence", type=str, default="both")
+
+    io_group = parser.add_argument_group("outputs")
+    io_group.add_argument("--metric_log_path", type=str, default="")
+    io_group.add_argument("--model_save_name", type=str, default="")
+    io_group.add_argument("--load_model_path", type=str, default="")
+
+    return parser
 
 
-def main():
-    seed = 150
-    deterministic_cudnn = False
-    set_seed(seed, deterministic_cudnn=deterministic_cudnn)
-
-    pt_dir = "/inspire/ssd/project/project-public/zhengkaipeng-240108120123/all_materials/data/all_anno_density"
-    txt_path = "sorted_by_journal_year.txt"
-    test_years = (2018, 2019, 2020, 2021, 2022, 2023, 2024)
-
-    run_ts = get_run_timestamp()
-    metric_log_path = f"train_metric_log_{run_ts}.txt"
-    model_save_name = f"torchmd-net-{run_ts}.pth"
-    load_model_path = None
-
-    learning_rate = 1e-4
-    beta1 = 0.9
-    beta2 = 0.999
-    epsilon = 1e-8
-    weight_decay = 1e-2
-    epochs = 100
-    warmup_epochs = 0
-    min_lr = 0.0
-    validation_interval = 500
-    batch_size_train = 16
-    batch_size_test = 1
-    num_classes = 98
-
-    rep_hparams = {
-        "hidden_channels": 512,
-        "attn_activation": "silu",
-        "num_heads": 8,
-        "distance_influence": "both",
-    }
-
-    train_files, test_files, missing = split_by_year_txt(
-        txt_path=txt_path,
-        pt_dir=pt_dir,
-        test_years=test_years,
-        pt_prefix="equiv_",
-        pt_suffix=".pt",
-        strict=False,
+def config_from_args(args: argparse.Namespace) -> HeavyTrainingConfig:
+    return HeavyTrainingConfig(
+        seed=args.seed,
+        deterministic_cudnn=args.deterministic_cudnn,
+        device=args.device,
+        pt_dir=args.pt_dir,
+        txt_path=args.txt_path,
+        test_years=tuple(args.test_years),
+        pt_prefix=args.pt_prefix,
+        pt_suffix=args.pt_suffix,
+        strict=args.strict,
+        check_dist=not args.no_dist_check,
+        learning_rate=args.learning_rate,
+        beta1=args.beta1,
+        beta2=args.beta2,
+        epsilon=args.epsilon,
+        weight_decay=args.weight_decay,
+        epochs=args.epochs,
+        warmup_epochs=args.warmup_epochs,
+        min_lr=args.min_lr,
+        validation_interval=args.validation_interval,
+        batch_size_train=args.batch_size_train,
+        batch_size_test=args.batch_size_test,
+        num_classes=args.num_classes,
+        hidden_channels=args.hidden_channels,
+        attn_activation=args.attn_activation,
+        num_heads=args.num_heads,
+        distance_influence=args.distance_influence,
+        metric_log_path=args.metric_log_path or None,
+        model_save_name=args.model_save_name or None,
+        load_model_path=args.load_model_path or None,
     )
 
-    print(f"Train Data: {len(train_files)}")
-    print(f"Test  Data: {len(test_files)}")
 
-    if missing:
-        print(f"[WARN] missing pt files: {len(missing)}")
-        for path in missing[:10]:
-            print("  ", path)
-
-    train_dataset, _ = build_simple_in_memory_dataset(train_files, is_eval=False)
-    test_dataset, init_mol_acc = build_simple_in_memory_dataset(test_files, is_eval=True)
-
-    print(f"Total class: {num_classes}")
-    print(f"Initial Mol Test Accuracy: {init_mol_acc * 100:.2f}%")
-
-    hparams = {
-        "seed": seed,
-        "deterministic_cudnn": deterministic_cudnn,
-        "paths": {"pt_dir": pt_dir, "txt_path": txt_path},
-        "split": {"test_years": list(test_years), "strict": False},
-        "data": {"train_size": len(train_files), "test_size": len(test_files)},
-        "training": {
-            "num_classes": num_classes,
-            "epochs": epochs,
-            "validation_interval": validation_interval,
-            "batch_size_train": batch_size_train,
-            "batch_size_test": batch_size_test,
-        },
-        "optimizer": {
-            "name": "AdamW",
-            "lr": learning_rate,
-            "betas": [beta1, beta2],
-            "eps": epsilon,
-            "weight_decay": weight_decay,
-        },
-        "lr_schedule": {
-            "name": "Warmup + Cosine (LambdaLR)",
-            "warmup_epochs": warmup_epochs,
-            "min_lr": min_lr,
+def build_run_hparams(
+    *,
+    config: HeavyTrainingConfig,
+    device: torch.device,
+    rep_config: RepresentationConfig,
+    train_files: list[str],
+    test_files: list[str],
+    train_stats: dict[str, int],
+    test_stats: dict[str, int],
+    init_mol_acc: float,
+    metric_log_path: str,
+    model_save_name: str,
+    run_ts: str,
+) -> dict[str, Any]:
+    return {
+        "run_timestamp": run_ts,
+        "config": to_serializable(config),
+        "device": str(device),
+        "data": {
+            "train_files": len(train_files),
+            "test_files": len(test_files),
+            "train_dataset_stats": train_stats,
+            "test_dataset_stats": test_stats,
+            "initial_test_mol_accuracy": init_mol_acc,
         },
         "model": {
             "representation_model": "TorchMD_ET",
-            "representation_hparams": rep_hparams,
+            "representation_hparams": to_serializable(rep_config),
             "output_model": "EquivariantScalar",
-            "output_in_dim": rep_hparams["hidden_channels"],
-            "output_num_classes": num_classes,
+            "output_num_classes": config.num_classes,
             "wrapper": "TorchMD_Net",
         },
         "checkpoint": {
             "model_save_name": model_save_name,
-            "load_model_path": load_model_path,
+            "load_model_path": config.load_model_path,
         },
         "logs": {"metric_log_path": metric_log_path},
     }
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size_test, shuffle=False)
 
-    model = build_model(rep_hparams, num_classes).to(DEVICE)
-    if load_model_path:
-        model.load_state_dict(torch.load(load_model_path, map_location=DEVICE))
+def run_training(config: HeavyTrainingConfig) -> None:
+    from torch_geometric.loader import DataLoader
+
+    device = resolve_device(config.device)
+    print("Device:", device)
+    set_seed(config.seed, deterministic_cudnn=config.deterministic_cudnn)
+
+    split_spec = SplitSpec(
+        txt_path=config.txt_path,
+        pt_dir=config.pt_dir,
+        test_years=config.test_years,
+        pt_prefix=config.pt_prefix,
+        pt_suffix=config.pt_suffix,
+        strict=config.strict,
+    )
+    train_files, test_files, missing = split_by_year_txt(split_spec)
+    print(f"Train files: {len(train_files)}")
+    print(f"Test files: {len(test_files)}")
+    preview_missing_files(missing)
+
+    train_dataset, _, train_stats = build_heavy_dataset(
+        train_files,
+        is_eval=False,
+        check_dist=config.check_dist,
+    )
+    test_dataset, init_mol_acc, test_stats = build_heavy_dataset(
+        test_files,
+        is_eval=True,
+        check_dist=config.check_dist,
+    )
+
+    if not train_dataset:
+        raise ValueError("Heavy training dataset is empty after preprocessing.")
+    if not test_dataset:
+        raise ValueError("Heavy test dataset is empty after preprocessing.")
+
+    rep_config = RepresentationConfig(
+        hidden_channels=config.hidden_channels,
+        attn_activation=config.attn_activation,
+        num_heads=config.num_heads,
+        distance_influence=config.distance_influence,
+    )
+
+    run_ts = get_run_timestamp()
+    metric_log_path = config.metric_log_path or f"train_metric_log_{run_ts}.txt"
+    model_save_name = config.model_save_name or f"torchmd-net-{run_ts}.pth"
+
+    print(f"Initial heavy mol test accuracy: {init_mol_acc * 100:.2f}%")
+    print(f"Heavy num_classes: {config.num_classes}")
+
+    hparams = build_run_hparams(
+        config=config,
+        device=device,
+        rep_config=rep_config,
+        train_files=train_files,
+        test_files=test_files,
+        train_stats=train_stats,
+        test_stats=test_stats,
+        init_mol_acc=init_mol_acc,
+        metric_log_path=metric_log_path,
+        model_save_name=model_save_name,
+        run_ts=run_ts,
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config.batch_size_train,
+        shuffle=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config.batch_size_test,
+        shuffle=False,
+    )
+
+    model = build_model(rep_config, config.num_classes).to(device)
+    if config.load_model_path:
+        model.load_state_dict(torch.load(config.load_model_path, map_location=device))
 
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=learning_rate,
-        betas=(beta1, beta2),
-        eps=epsilon,
-        weight_decay=weight_decay,
+        lr=config.learning_rate,
+        betas=(config.beta1, config.beta2),
+        eps=config.epsilon,
+        weight_decay=config.weight_decay,
     )
     scheduler = LambdaLR(
         optimizer,
-        lr_lambda=build_lr_lambda(learning_rate, min_lr, warmup_epochs, epochs),
+        lr_lambda=build_lr_lambda(
+            config.learning_rate,
+            config.min_lr,
+            config.warmup_epochs,
+            config.epochs,
+        ),
     )
-    max_mol_accuracy = -1.0
+    best_mol_accuracy = float("-inf")
+    global_step = 0
 
     with open(metric_log_path, "w", encoding="utf-8", buffering=1) as log_f:
-        write_log_header(log_f, run_ts, test_years, len(train_files), len(test_files))
+        write_log_header(
+            log_f,
+            run_ts=run_ts,
+            device=device,
+            test_years=config.test_years,
+            train_size=len(train_files),
+            test_size=len(test_files),
+        )
         write_hparams(log_f, hparams)
 
         model.train()
-        for epoch in range(epochs):
-            for iteration, data in enumerate(train_loader):
+        for epoch in range(config.epochs):
+            for step_idx, data in enumerate(train_loader, 1):
+                global_step += 1
                 optimizer.zero_grad()
-                data = data.to(DEVICE)
+                data = data.to(device)
 
                 outputs, _ = model(data.z, data.pos, data.batch)
                 logits = outputs[data.mask]
                 loss = criterion(logits, data.y)
 
                 if torch.isnan(loss):
-                    print("Loss contains NaN!")
-                    break
+                    raise RuntimeError(f"Loss became NaN at epoch={epoch} step={global_step}.")
 
                 loss.backward()
                 optimizer.step()
 
-                if (iteration + 1) % validation_interval == 0:
-                    atom_accuracy, mol_accuracy = eval_two_pass(
-                        model=model,
-                        test_loader=test_loader,
-                        allow_one_mismatch=False,
-                    )
-                    model.train()
+                should_validate = (
+                    config.validation_interval > 0
+                    and global_step % config.validation_interval == 0
+                ) or step_idx == len(train_loader)
+                if not should_validate:
+                    continue
 
-                    if mol_accuracy > max_mol_accuracy:
-                        max_mol_accuracy = mol_accuracy
-                        torch.save(model.state_dict(), model_save_name)
+                metrics = evaluate_heavy_two_pass(
+                    model=model,
+                    test_loader=test_loader,
+                    device=device,
+                    allow_one_mismatch=False,
+                )
+                model.train()
 
-                    msg1 = (
-                        f"Epoch {epoch}, Iteration {iteration + 1}: Loss: {loss.item()}, "
-                        f"Atom Test Accuracy: {atom_accuracy * 100:.2f}%, "
-                        f"Mol Test Accuracy: {mol_accuracy * 100:.2f}%"
-                    )
-                    msg2 = f"Max Mol Test Accuracy: {max_mol_accuracy * 100:.2f}%"
-                    print(msg1)
-                    print(msg2)
-                    log_f.write(msg1 + "\n")
-                    log_f.write(msg2 + "\n")
+                if metrics.mol_accuracy > best_mol_accuracy:
+                    best_mol_accuracy = metrics.mol_accuracy
+                    torch.save(model.state_dict(), model_save_name)
+
+                msg1 = (
+                    f"Epoch {epoch + 1}/{config.epochs}, Step {global_step}: "
+                    f"loss={loss.item():.6f}, "
+                    f"atom_acc={metrics.atom_accuracy * 100:.2f}%, "
+                    f"mol_acc={metrics.mol_accuracy * 100:.2f}%"
+                )
+                msg2 = f"Best mol_acc: {best_mol_accuracy * 100:.2f}%"
+                print(msg1)
+                print(msg2)
+                log_f.write(msg1 + "\n")
+                log_f.write(msg2 + "\n")
 
             scheduler.step()
 
-        atom_accuracy, mol_accuracy = eval_two_pass(
+        final_metrics = evaluate_heavy_two_pass(
             model=model,
             test_loader=test_loader,
+            device=device,
             allow_one_mismatch=True,
         )
-        msg1 = (
-            f"Atom Test Accuracy: {atom_accuracy * 100:.2f}%, "
-            f"Mol Test Accuracy: {mol_accuracy * 100:.2f}%"
+        final_msg = (
+            f"[Final] atom_acc={final_metrics.atom_accuracy * 100:.2f}%, "
+            f"mol_acc={final_metrics.mol_accuracy * 100:.2f}% "
+            "(allow_one_mismatch=True)"
         )
-        msg2 = f"Max Mol Test Accuracy: {max_mol_accuracy * 100:.2f}%"
-        print(msg1)
-        print(msg2)
-        log_f.write(msg1 + "\n")
-        log_f.write(msg2 + "\n")
+        best_msg = f"Best mol_acc: {best_mol_accuracy * 100:.2f}%"
+        print(final_msg)
+        print(best_msg)
+        log_f.write(final_msg + "\n")
+        log_f.write(best_msg + "\n")
+
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    config = config_from_args(args)
+    run_training(config)
 
 
 if __name__ == "__main__":

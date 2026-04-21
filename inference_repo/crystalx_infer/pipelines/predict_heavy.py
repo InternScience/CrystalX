@@ -1,226 +1,196 @@
+"""Single-case heavy-atom prediction entrypoint."""
+
+from __future__ import annotations
+
 import argparse
-import os
+import json
+from dataclasses import dataclass
 
-import numpy as np
-import torch
-import torch.nn.functional as F
-from cctbx.xray.structure import structure
-from iotbx.shelx import crystal_symmetry_from_ins
-from rdkit import Chem
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader
-from tqdm import tqdm
-
-from crystalx_infer.common.utils import (
+from crystalx_infer.common.checkpoints import HEAVY_CHECKPOINT, resolve_checkpoint_path
+from crystalx_infer.common.chem import atomic_num_from_symbol, atomic_symbol_from_z
+from crystalx_infer.common.heavy import (
+    build_sorted_init_z_from_ratio,
+    deduplicate_cartesian_positions,
+    parse_sfac_unit_from_shelx,
+    run_two_pass_heavy_prediction,
+    trim_shelxt_pred_for_unit_divisibility,
+)
+from crystalx_infer.common.modeling import DEFAULT_CHECKPOINT_HIDDEN_CHANNELS, load_torchmd_model
+from crystalx_infer.common.paths import HeavyPredictionPaths
+from crystalx_infer.common.runtime import resolve_device
+from crystalx_infer.common.shelx import (
     copy_file,
     get_equiv_pos2,
     load_shelxt,
+    load_shelxt_final,
     update_shelxt,
 )
-from crystalx_infer.models.noise_output_model import EquivariantScalar
-from crystalx_infer.models.torchmd_et import TorchMD_ET
-from crystalx_infer.models.torchmd_net import TorchMD_Net
 
 
-HIDDEN_CHANNELS = 512
-NUM_CLASSES = 98
+@dataclass
+class HeavyPredictConfig:
+    fname: str = ""
+    work_dir: str = ""
+    res_path: str = ""
+    hkl_path: str = ""
+    model_path: str = HEAVY_CHECKPOINT.filename
+    hf_repo_id: str = ""
+    device: str = "auto"
+    num_classes: int = 98
+    hidden_channels: int = DEFAULT_CHECKPOINT_HIDDEN_CHANNELS
+    refine_round: int = 16
+    topk: int = 5
 
 
-def parse_sfac_unit_from_ins(ins_path):
+def build_topk_payload(prob, candidate_elements, atom_names, predicted_atomic_numbers, requested_topk):
+    if requested_topk <= 0:
+        raise ValueError("--topk must be >= 1")
+
+    if prob.ndim != 2:
+        raise ValueError(f"Expected 2D probability tensor, got shape={tuple(prob.shape)}")
+
+    candidate_elements_cpu = candidate_elements.detach().cpu()
+    prob_cpu = prob.detach().cpu()
+    predicted_cpu = predicted_atomic_numbers.detach().cpu()
+    atom_count = int(prob_cpu.shape[0])
+    if int(predicted_cpu.shape[0]) != atom_count:
+        raise ValueError(
+            "Heavy probability rows do not match predicted labels: "
+            f"prob_rows={atom_count} predicted={int(predicted_cpu.shape[0])}"
+        )
+    if len(atom_names) != atom_count:
+        raise ValueError(
+            "Heavy probability rows do not match atom names: "
+            f"prob_rows={atom_count} atom_names={len(atom_names)}"
+        )
+    effective_topk = min(int(requested_topk), int(prob_cpu.shape[1]))
+    topk_prob, topk_idx = prob_cpu.topk(k=effective_topk, dim=1)
+
+    atoms = []
+    for atom_idx in range(atom_count):
+        ranked = []
+        for rank_idx, (prob_value, class_idx) in enumerate(
+            zip(topk_prob[atom_idx].tolist(), topk_idx[atom_idx].tolist()),
+            start=1,
+        ):
+            atomic_number = int(candidate_elements_cpu[int(class_idx)].item())
+            ranked.append(
+                {
+                    "rank": rank_idx,
+                    "atomic_number": atomic_number,
+                    "symbol": atomic_symbol_from_z(atomic_number),
+                    "probability": float(prob_value),
+                }
+            )
+
+        predicted_atomic_number = int(predicted_cpu[atom_idx].item())
+        atoms.append(
+            {
+                "atom_index": atom_idx + 1,
+                "input_atom_name": atom_names[atom_idx],
+                "predicted_atomic_number": predicted_atomic_number,
+                "predicted_symbol": atomic_symbol_from_z(predicted_atomic_number),
+                "coverage_adjusted": bool(
+                    ranked
+                    and predicted_atomic_number != int(ranked[0]["atomic_number"])
+                ),
+                "topk": ranked,
+            }
+        )
+
+    return {
+        "fname": None,
+        "requested_topk": int(requested_topk),
+        "effective_topk": int(effective_topk),
+        "candidate_elements": [
+            {
+                "atomic_number": int(atomic_number.item()),
+                "symbol": atomic_symbol_from_z(int(atomic_number.item())),
+            }
+            for atomic_number in candidate_elements_cpu
+        ],
+        "atoms": atoms,
+    }
+
+
+def load_heavy_input_from_res(res_path: str):
+    real_frac, shelxt_pred, _, isotropy_list = load_shelxt(
+        res_path,
+        is_check_sfac=True,
+    )
+    _, atom_names, _, _ = load_shelxt(
+        res_path,
+        is_atom_name=True,
+    )
+    if len(shelxt_pred) > 0:
+        return real_frac, shelxt_pred, atom_names, isotropy_list
+
+    # Fallback for refined/template .res files that store atom rows after FVAR/ANIS.
+    real_frac, shelxt_pred = load_shelxt_final(
+        res_path,
+        begin_flag="FVAR",
+        is_hydro=False,
+    )
+    _, atom_names = load_shelxt_final(
+        res_path,
+        begin_flag="FVAR",
+        is_atom_name=True,
+        is_hydro=False,
+    )
+    if len(shelxt_pred) > 0:
+        return real_frac, shelxt_pred, atom_names, None
+
+    real_frac, shelxt_pred = load_shelxt_final(
+        res_path,
+        begin_flag="ANIS",
+        is_hydro=False,
+    )
+    _, atom_names = load_shelxt_final(
+        res_path,
+        begin_flag="ANIS",
+        is_atom_name=True,
+        is_hydro=False,
+    )
+    return real_frac, shelxt_pred, atom_names, None
+
+
+def run_prediction(config: HeavyPredictConfig) -> None:
+    import numpy as np
+    import torch
+    from cctbx.xray.structure import structure
+    from iotbx.shelx import crystal_symmetry_from_ins
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+    from tqdm import tqdm
+
+    device = resolve_device(config.device)
+    paths = HeavyPredictionPaths.from_values(
+        work_dir=config.work_dir,
+        fname=config.fname,
+        res_path=config.res_path,
+        hkl_path=config.hkl_path,
+    )
+    if config.topk <= 0:
+        raise ValueError("--topk must be >= 1")
+    if not paths.res_input_path.exists():
+        raise FileNotFoundError(f"Heavy input .res not found: {paths.res_input_path}")
+
+    real_frac, shelxt_pred, atom_names, isotropy_list = load_heavy_input_from_res(
+        str(paths.res_input_path)
+    )
+    if len(shelxt_pred) == 0:
+        raise ValueError(f"No heavy-atom rows found in {paths.res_input_path}")
+
     sfac = None
     unit = None
-
-    with open(ins_path, "r", encoding="utf-8", errors="ignore") as file_obj:
-        for line in file_obj:
-            line = line.strip()
-            if not line:
-                continue
-
-            upper_line = line.upper()
-            if upper_line.startswith("SFAC "):
-                sfac = [item.capitalize() for item in line.split()[1:]]
-            elif upper_line.startswith("UNIT "):
-                unit = [int(float(item)) for item in line.split()[1:]]
-
-    if not sfac or not unit:
-        raise ValueError(f"Missing SFAC/UNIT in {ins_path}")
-    if len(sfac) != len(unit):
-        raise ValueError(f"SFAC/UNIT length mismatch in {ins_path}: {len(sfac)} vs {len(unit)}")
-
-    return sfac, unit
-
-
-def trim_shelxt_pred_for_unit_divisibility(real_frac, shelxt_pred, isotropy_list, non_h_unit_total):
-    pred_n = int(len(shelxt_pred))
-    unit_n = int(non_h_unit_total)
-    if pred_n <= 0 or unit_n <= 0:
-        return real_frac, shelxt_pred, isotropy_list, 0
-    if (pred_n % unit_n == 0) or (unit_n % pred_n == 0):
-        return real_frac, shelxt_pred, isotropy_list, 0
-
-    new_len = pred_n
-    while new_len > 0 and not ((new_len % unit_n == 0) or (unit_n % new_len == 0)):
-        new_len -= 1
-
-    trim_n = pred_n - new_len
-    if trim_n <= 0:
-        return real_frac, shelxt_pred, isotropy_list, 0
-
-    real_frac = real_frac[:new_len]
-    shelxt_pred = shelxt_pred[:new_len]
-    if isotropy_list is not None and len(isotropy_list) >= new_len:
-        isotropy_list = isotropy_list[:new_len]
-
-    print(
-        f"[WARN] SHELXT pred divisibility adjust: pred_n={pred_n}, nonH_unit_total={unit_n}, "
-        f"trim_tail={trim_n} -> pred_n={new_len}"
-    )
-    return real_frac, shelxt_pred, isotropy_list, trim_n
-
-
-def build_sorted_init_z_from_ratio(sfac, unit, target_len):
-    if target_len <= 0:
-        return []
-
-    valid_entries = []
-    for symbol, count in zip(sfac, unit):
-        if symbol.upper() == "H":
-            continue
-        try:
-            atomic_num = Chem.Atom(symbol).GetAtomicNum()
-        except Exception:
-            continue
-        if count > 0:
-            valid_entries.append((atomic_num, int(count)))
-
-    if not valid_entries:
-        raise ValueError("No valid positive non-H SFAC/UNIT entries")
-
-    counts = np.array([count for _, count in valid_entries], dtype=np.float64)
-    weights = counts / np.sum(counts)
-    raw_alloc = weights * float(target_len)
-    alloc = np.floor(raw_alloc).astype(np.int64)
-
-    remain = int(target_len - int(np.sum(alloc)))
-    if remain > 0:
-        frac = raw_alloc - alloc
-        for idx in np.argsort(-frac)[:remain]:
-            alloc[idx] += 1
-
-    init_z = []
-    for (atomic_num, _), count in zip(valid_entries, alloc.tolist()):
-        if count > 0:
-            init_z.extend([int(atomic_num)] * int(count))
-
-    if len(init_z) < target_len:
-        min_z = min(atomic_num for atomic_num, _ in valid_entries)
-        init_z.extend([int(min_z)] * (target_len - len(init_z)))
-    elif len(init_z) > target_len:
-        init_z = init_z[:target_len]
-
-    return sorted(init_z, reverse=True)
-
-
-def deduplicate_cartesian_positions(expanded_cart, expanded_z):
-    real_cart = []
-    z = []
-
-    for idx in range(expanded_cart.shape[0]):
-        position = expanded_cart[idx].tolist()
-        if position not in real_cart:
-            real_cart.append(position)
-            z.append(expanded_z[idx])
-
-    return real_cart, z
-
-
-def build_model(model_path, device):
-    representation_model = TorchMD_ET(
-        hidden_channels=HIDDEN_CHANNELS,
-        attn_activation="silu",
-        num_heads=8,
-        distance_influence="both",
-    )
-    output_model = EquivariantScalar(HIDDEN_CHANNELS, num_classes=NUM_CLASSES)
-    model = TorchMD_Net(
-        representation_model=representation_model,
-        output_model=output_model,
-    ).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
-    model.eval()
-    return model
-
-
-@torch.no_grad()
-def enforce_coverage_by_prob(prob, sfac, pred):
-    num_atoms, num_elements = prob.shape
-    if num_atoms == 0 or num_elements == 0 or num_atoms < num_elements:
-        return pred
-
-    elem2idx = {int(sfac[idx].item()): idx for idx in range(num_elements)}
-    pred_idx = torch.tensor(
-        [elem2idx[int(value.item())] for value in pred],
-        device=pred.device,
-        dtype=torch.long,
-    )
-    counts = torch.bincount(pred_idx, minlength=num_elements).clone()
-    used_atoms = set()
-    missing = (counts == 0).nonzero(as_tuple=False).view(-1).tolist()
-
-    while missing:
-        changed = False
-        for miss_idx in missing:
-            safe_mask = counts[pred_idx] > 1
-            if used_atoms:
-                used_mask = torch.zeros(num_atoms, device=pred.device, dtype=torch.bool)
-                used_mask[list(used_atoms)] = True
-                safe_mask = safe_mask & (~used_mask)
-            if not torch.any(safe_mask):
-                return pred
-
-            target_prob = prob[:, miss_idx]
-            cost = (-target_prob).masked_fill(~safe_mask, float("inf"))
-            atom_idx = int(torch.argmin(cost).item())
-
-            old_idx = int(pred_idx[atom_idx].item())
-            if old_idx == miss_idx:
-                continue
-
-            pred[atom_idx] = sfac[miss_idx]
-            pred_idx[atom_idx] = miss_idx
-            used_atoms.add(atom_idx)
-            counts[old_idx] -= 1
-            counts[miss_idx] += 1
-            changed = True
-
-        if not changed:
-            break
-        missing = (counts == 0).nonzero(as_tuple=False).view(-1).tolist()
-
-    return pred
-
-
-def main(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    origin_ins_path = f"{args.work_dir}/{args.fname}.ins"
-    res_file_path = f"{args.work_dir}/{args.fname}_a.res"
-    hkl_file_path = f"{args.work_dir}/{args.fname}_a.hkl"
-    new_res_file_path = f"{args.work_dir}/{args.fname}_AI.ins"
-    new_hkl_file_path = f"{args.work_dir}/{args.fname}_AI.hkl"
-
-    real_frac, shelxt_pred, _, isotropy_list = load_shelxt(res_file_path, is_check_sfac=True)
-
-    sfac0 = None
-    unit0 = None
     non_h_unit_total = 0
     try:
-        sfac0, unit0 = parse_sfac_unit_from_ins(origin_ins_path)
+        sfac, unit = parse_sfac_unit_from_shelx(str(paths.res_input_path))
         non_h_unit_total = sum(
-            int(count) for symbol, count in zip(sfac0, unit0) if symbol.upper() != "H"
+            int(count) for symbol, count in zip(sfac, unit) if symbol.upper() != "H"
         )
     except Exception as exc:
-        print(f"[WARN] Cannot parse SFAC/UNIT for divisibility check, skip trim: {exc}")
+        print(f"[WARN] Cannot parse SFAC/UNIT from {paths.res_input_path.name}, skip trim: {exc}")
 
     if non_h_unit_total > 0:
         real_frac, shelxt_pred, isotropy_list, _ = trim_shelxt_pred_for_unit_divisibility(
@@ -229,71 +199,162 @@ def main(args):
             isotropy_list,
             non_h_unit_total,
         )
+    atom_names = atom_names[: len(shelxt_pred)]
 
     real_num = len(shelxt_pred)
-    crystal_symmetry = crystal_symmetry_from_ins.extract_from(res_file_path)
+    crystal_symmetry = crystal_symmetry_from_ins.extract_from(str(paths.res_input_path))
     coarse_structure = structure(crystal_symmetry=crystal_symmetry)
 
-    real_frac = np.array(real_frac)
+    real_frac_array = np.array(real_frac)
     expanded_cart, expanded_symbols = get_equiv_pos2(
-        real_frac,
+        real_frac_array,
         shelxt_pred,
         coarse_structure,
         radius=3.2,
     )
-    expanded_z = [Chem.Atom(symbol.capitalize()).GetAtomicNum() for symbol in expanded_symbols]
+    expanded_z = [atomic_num_from_symbol(symbol.capitalize()) for symbol in expanded_symbols]
 
     real_cart, z = deduplicate_cartesian_positions(expanded_cart, expanded_z)
     if len(z) >= real_num:
-        if sfac0 is not None and unit0 is not None:
-            z = build_sorted_init_z_from_ratio(sfac0, unit0, real_num) + z[real_num:]
+        if sfac is not None and unit is not None:
+            z = build_sorted_init_z_from_ratio(sfac, unit, real_num) + z[real_num:]
         else:
             print("[WARN] SFAC/UNIT init fallback to SHELXT z: SFAC/UNIT unavailable.")
 
     mask = torch.zeros(len(z), dtype=torch.bool)
-    mask[: len(shelxt_pred)] = True
-
+    mask[:real_num] = True
     test_loader = DataLoader(
-        [Data(z=torch.tensor(z), pos=torch.from_numpy(np.array(real_cart, dtype=np.float32)), mask=mask)],
+        [
+            Data(
+                z=torch.tensor(z, dtype=torch.long),
+                pos=torch.from_numpy(np.array(real_cart, dtype=np.float32)),
+                mask=mask,
+            )
+        ],
         batch_size=1,
         shuffle=False,
     )
-    model = build_model(args.model_path, device)
+
+    model_path = resolve_checkpoint_path(
+        requested_path=config.model_path,
+        kind="heavy",
+        repo_id=config.hf_repo_id,
+    )
+    model, resolved_num_classes = load_torchmd_model(
+        model_path,
+        device=device,
+        num_classes=config.num_classes,
+        hidden_channels=config.hidden_channels,
+    )
+    print(f"[INFO] device={device} num_classes={resolved_num_classes} model={model_path}")
 
     predicted_symbols = []
+    topk_payload = None
     with torch.inference_mode():
-        for data in tqdm(test_loader):
+        for data in tqdm(test_loader, desc="Predict heavy"):
             data = data.to(device)
+            candidate_elements = torch.unique(data.z)
+            prob, predicted, _ = run_two_pass_heavy_prediction(
+                model=model,
+                input_z=data.z,
+                pos=data.pos,
+                batch=data.batch,
+                mask=data.mask,
+                candidate_elements=candidate_elements,
+                enforce_element_coverage=True,
+            )
+            predicted_cpu = predicted.to("cpu")
+            predicted_symbols = [atomic_symbol_from_z(item) for item in predicted_cpu.tolist()]
+            topk_payload = build_topk_payload(
+                prob=prob,
+                candidate_elements=candidate_elements,
+                atom_names=atom_names,
+                predicted_atomic_numbers=predicted_cpu,
+                requested_topk=config.topk,
+            )
 
-            logits = model(data.z, data.pos, data.batch)
-            sfac = torch.unique(data.z)
-            logits = F.softmax(logits[:, sfac], dim=-1)
-            predicted = sfac[torch.argmax(logits, dim=1)]
+    if topk_payload is None:
+        raise RuntimeError("Heavy prediction did not produce probability outputs.")
+    topk_payload["fname"] = paths.output_stem
 
-            logits = model(predicted, data.pos, data.batch)
-            logits = F.softmax(logits[data.mask][:, sfac], dim=-1)
-            predicted = sfac[torch.argmax(logits, dim=1)]
-            predicted = enforce_coverage_by_prob(logits, sfac, predicted)
-            predicted_symbols = [Chem.Atom(int(item)).GetSymbol() for item in predicted.cpu().tolist()]
-
-    copy_file(hkl_file_path, new_hkl_file_path)
     update_shelxt(
-        res_file_path,
-        new_res_file_path,
+        str(paths.res_input_path),
+        str(paths.output_ins_path),
         predicted_symbols,
         no_sfac=True,
-        refine_round=16,
+        refine_round=config.refine_round,
     )
+    if paths.hkl_input_path is not None:
+        copy_file(str(paths.hkl_input_path), str(paths.output_hkl_path))
+    with open(paths.topk_path, "w", encoding="utf-8") as file_obj:
+        json.dump(topk_payload, file_obj, indent=2)
+    print(
+        f"[INFO] Wrote heavy prediction: {paths.output_ins_path.name} | "
+        f"atoms={len(predicted_symbols)}"
+    )
+    if paths.hkl_input_path is not None:
+        print(f"[INFO] Copied heavy HKL: {paths.output_hkl_path.name}")
+    else:
+        print("[INFO] No HKL input provided; skipped writing heavy _AI.hkl.")
+    print(f"[INFO] Saved heavy top-k probabilities: {paths.topk_path.name}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "CrystalX heavy-atom predictor. Use --res_path for standalone .res input, "
+            "or keep --fname/--work_dir for the legacy SHELXT naming convention."
+        )
+    )
+    parser.add_argument(
+        "--fname",
+        type=str,
+        default=HeavyPredictConfig.fname,
+        help="Output stem. In legacy mode this is the case prefix; in --res_path mode it overrides the derived stem.",
+    )
+    parser.add_argument(
+        "--work_dir",
+        type=str,
+        default=HeavyPredictConfig.work_dir,
+        help="Legacy case directory, or output directory when --res_path is used.",
+    )
+    parser.add_argument(
+        "--res_path",
+        type=str,
+        default=HeavyPredictConfig.res_path,
+        help="Standalone heavy-stage input .res path. When set, the predictor reads atom names, coordinates, and SFAC/UNIT from this file.",
+    )
+    parser.add_argument(
+        "--hkl_path",
+        type=str,
+        default=HeavyPredictConfig.hkl_path,
+        help="Optional .hkl paired with --res_path. When provided, it is copied to the _AI.hkl output.",
+    )
+    parser.add_argument("--model_path", type=str, default=HeavyPredictConfig.model_path)
+    parser.add_argument("--hf_repo_id", type=str, default=HeavyPredictConfig.hf_repo_id)
+    parser.add_argument("--device", type=str, default=HeavyPredictConfig.device, choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--num_classes", type=int, default=HeavyPredictConfig.num_classes)
+    parser.add_argument(
+        "--hidden_channels",
+        type=int,
+        default=HeavyPredictConfig.hidden_channels,
+        help="Checkpoint hidden width. Use 0 to infer automatically from the checkpoint.",
+    )
+    parser.add_argument("--refine_round", type=int, default=HeavyPredictConfig.refine_round)
+    parser.add_argument(
+        "--topk",
+        type=int,
+        default=HeavyPredictConfig.topk,
+        help="How many highest-probability classes to save per atom in the JSON report.",
+    )
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    run_prediction(HeavyPredictConfig(**vars(args)))
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Non-hydro Atom Classifier")
-    parser.add_argument("--fname", type=str, default="sample2", help="file name")
-    parser.add_argument("--work_dir", type=str, default="work_dir", help="work directory")
-    parser.add_argument(
-        "--model_path",
-        type=str,
-        default="final_main_model_add_no_noise_fold_3.pth",
-        help="model path",
-    )
-    main(parser.parse_args())
+    main()

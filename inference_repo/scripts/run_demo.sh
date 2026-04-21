@@ -6,6 +6,7 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PYTHONPATH="$REPO_DIR${PYTHONPATH:+:$PYTHONPATH}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 resolve_bin() {
     local_path="$SCRIPT_DIR/$1"
@@ -22,7 +23,7 @@ resolve_bin() {
 }
 
 now_ts() {
-    python -c "import time; print(f'{time.time():.6f}')"
+    "$PYTHON_BIN" -c "import time; print(f'{time.time():.6f}')"
 }
 
 elapsed_1dp() {
@@ -91,8 +92,31 @@ print_python_step_summary() {
     fi
 }
 
-main_model_name="$REPO_DIR/weights/final_main_model_add_no_noise_fold_3.pth"
-hydro_model_name="$REPO_DIR/weights/final_hydro_model_add_no_noise_fold_3.pth"
+download_weights_if_needed() {
+    if [ -f "$main_model_name" ] && [ -f "$hydro_model_name" ]; then
+        return 0
+    fi
+
+    hf_repo_id="${CRYSTALX_HF_REPO_ID:-}"
+    if [ -z "$hf_repo_id" ]; then
+        return 0
+    fi
+
+    echo "[INFO] Missing local CrystalX checkpoints. Downloading from Hugging Face: $hf_repo_id"
+    env PYTHONPATH="$PYTHONPATH" "$PYTHON_BIN" -m crystalx_infer.tools.download_weights --repo-id "$hf_repo_id"
+}
+
+main_model_name="$REPO_DIR/weights/crystalx-heavy.pth"
+hydro_model_name="$REPO_DIR/weights/crystalx-hydro.pth"
+legacy_main_model_name="$REPO_DIR/weights/final_main_model_add_no_noise_fold_3.pth"
+legacy_hydro_model_name="$REPO_DIR/weights/final_hydro_model_add_no_noise_fold_3.pth"
+
+if [ ! -f "$main_model_name" ] && [ -f "$legacy_main_model_name" ]; then
+    main_model_name="$legacy_main_model_name"
+fi
+if [ ! -f "$hydro_model_name" ] && [ -f "$legacy_hydro_model_name" ]; then
+    hydro_model_name="$legacy_hydro_model_name"
+fi
 
 shelxt_bin="$(resolve_bin shelxt || true)"
 shelxl_bin="$(resolve_bin shelxl || true)"
@@ -110,12 +134,17 @@ if [ -z "$platon_bin" ]; then
     echo "[ERROR] Cannot find platon in $SCRIPT_DIR or PATH"
     exit 1
 fi
+download_weights_if_needed
 if [ ! -f "$main_model_name" ]; then
-    echo "[ERROR] Missing main model: $main_model_name"
+    echo "[ERROR] Missing heavy model checkpoint: $main_model_name"
+    echo "[ERROR] Run: python -m crystalx_infer.tools.download_weights --repo-id <hf_repo_id>"
+    echo "[ERROR] Or set CRYSTALX_HF_REPO_ID=<hf_repo_id> and rerun."
     exit 1
 fi
 if [ ! -f "$hydro_model_name" ]; then
-    echo "[ERROR] Missing hydro model: $hydro_model_name"
+    echo "[ERROR] Missing hydro model checkpoint: $hydro_model_name"
+    echo "[ERROR] Run: python -m crystalx_infer.tools.download_weights --repo-id <hf_repo_id>"
+    echo "[ERROR] Or set CRYSTALX_HF_REPO_ID=<hf_repo_id> and rerun."
     exit 1
 fi
 
@@ -133,7 +162,7 @@ cp "${fname}.ins" "$work_dir/${fname}.ins"
 # To do: Check the validility of the phasing results
 
 run_python_step "predict_heavy.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.pipelines.predict_heavy --fname="$fname" --work_dir="$work_dir" --model_path="$main_model_name"
+    env PYTHONPATH="$PYTHONPATH" "$PYTHON_BIN" -m crystalx_infer.pipelines.predict_heavy --fname="$fname" --work_dir="$work_dir" --model_path="$main_model_name"
 
 err_mes="$work_dir/ERROR.json"
 if [ -e "$err_mes" ]; then
@@ -146,15 +175,15 @@ fi
 
 # Then build AIBond and run SHELXL to generate connectivity .lst for hydro.
 run_python_step "prepare_bond_inputs.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.postprocess.prepare_bond_inputs --fname="${fname}_AI" --work_dir="$work_dir"
+    env PYTHONPATH="$PYTHONPATH" "$PYTHON_BIN" -m crystalx_infer.postprocess.prepare_bond_inputs --fname="${fname}_AI" --work_dir="$work_dir"
 "$shelxl_bin" "$work_dir/${fname}_AIBond"
 
 run_python_step "predict_hydro.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.pipelines.predict_hydro --fname="${fname}_AI" --work_dir="$work_dir" --model_path="$hydro_model_name"
+    env PYTHONPATH="$PYTHONPATH" "$PYTHON_BIN" -m crystalx_infer.pipelines.predict_hydro --fname="${fname}_AI" --work_dir="$work_dir" --model_path="$hydro_model_name"
 "$shelxl_bin" "$work_dir/${fname}_AIhydro"
 
 run_python_step "prepare_weight_refine.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.postprocess.prepare_weight_refine --fname="${fname}_AIhydro" --work_dir="$work_dir"
+    env PYTHONPATH="$PYTHONPATH" "$PYTHON_BIN" -m crystalx_infer.postprocess.prepare_weight_refine --fname="${fname}_AIhydro" --work_dir="$work_dir"
 "$shelxl_bin" "$work_dir/${fname}_AIhydroWeight"
 
 # perhaps not needed
@@ -166,7 +195,7 @@ run_python_step "prepare_weight_refine.py" \
 "$platon_bin" -u "$work_dir/${fname}_AIhydroWeight.cif"
 
 run_python_step "write_final_outputs.py" \
-    env PYTHONPATH="$PYTHONPATH" python -m crystalx_infer.postprocess.write_final_outputs --fname="${fname}_AIhydroWeight" --work_dir="$work_dir"
+    env PYTHONPATH="$PYTHONPATH" "$PYTHON_BIN" -m crystalx_infer.postprocess.write_final_outputs --fname="${fname}_AIhydroWeight" --work_dir="$work_dir"
 
 print_python_step_summary
 
