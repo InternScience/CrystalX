@@ -1,7 +1,7 @@
 # CrystalX: High-accuracy Crystal Structure Analysis Using Deep Learning
 
-**Accepted by the *Journal of the American Chemical Society* (JACS)**
-**Invited for a journal cover feature**
+**Accepted by the *Journal of the American Chemical Society* (JACS); invited for a journal cover feature**
+
 
 ## Overview
 
