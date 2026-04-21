@@ -1,0 +1,28 @@
+# Minimal shared environment for CrystalX training and inference.
+# PyTorch / PyG packages are pinned to the same 2.4.0 / CUDA 12.1 stack
+
+name: crystalx
+channels:
+  - pyg
+  - pytorch
+  - nvidia
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  - pip
+  - pytorch=2.4.0
+  - pytorch-cuda=12.1
+  - pyg=2.7.0
+  - pytorch-scatter=2.1.2
+  - pytorch-sparse=0.6.18
+  - pytorch-cluster=1.6.3
+  - numpy
+  - scipy
+  - tqdm
+  - ase
+  - rdkit
+  - cctbx-base
+  - scikit-learn
+  - pip:
+      - huggingface_hub>=0.34
