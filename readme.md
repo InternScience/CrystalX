@@ -5,7 +5,7 @@
 
 ## Overview
 
-CrystalX is an AI system for routine single-crystal structure analysis from real experimental X-ray diffraction (XRD) data.
+CrystalX is the first AI system for routine single-crystal structure analysis from real experimental X-ray diffraction (XRD) data.
 
 Designed specifically for everyday single-crystal structure solution, CrystalX uses geometric deep learning to model electron density and capture underlying three-dimensional geometric interactions directly from large-scale experimental XRD datasets. Compared with traditional rule-based approaches for automatic elemental determination, such as those used in **SHELXT** and **Olex2**, CrystalX delivers substantially improved accuracy and robustness.
 
