@@ -13,7 +13,7 @@ In prospective, deployment-style evaluations, CrystalX was also compared with **
 
 CrystalX provides the following capabilities:
 
-* Accurate discrimination between non-hydrogen atoms with similar atomic numbers, including challenging pairs such as **C/N/O** and **P/S/Cl**
+* Accurate discrimination between non-hydrogen atoms with similar atomic numbers, such as **C/N/O** and **P/S/Cl**
 * Fast and fully correct solution of large organometallic structures containing up to **370 non-hydrogen atoms**
 * Detection of **9 verified expert interpretation errors** among **1,559** held-out structures published in **JCR Q1 journals**, including subtle cases that triggered no **CheckCIF A/B** alerts
 * Confidence scores for both heavy-atom and hydrogen predictions
@@ -28,7 +28,7 @@ CrystalX adopts a two-stage geometric deep learning pipeline to predict both non
 
 Both public checkpoints are built on an Equivariant Transformer backbone, specifically TorchMD-NET.
 
-For hydrogen prediction, CrystalX leverages both intramolecular and intermolecular context by incorporating symmetry-equivalent neighbors within 3.2 Å. This design yields more than a 7% improvement over using intramolecular information alone.
+For hydrogen prediction, CrystalX uses both intramolecular and intermolecular context. This is important because hydrogen atoms often lie at the outer edges of molecules, and their placement is strongly influenced by interactions such as hydrogen bonding with neighboring molecules. To capture this chemical environment, CrystalX incorporates symmetry-equivalent neighbors within 3.2 Å, leading to more than 7% improvement over using intramolecular information alone.
 
 ---
 
@@ -138,6 +138,10 @@ This wrapper corresponds to the minimal wrapper: shelxt, heavy-atom prediction, 
 
 The dataset is constructed from the open-access Crystallography Open Database (COD) using real experimental diffraction data. To ensure reliable supervision, only structures whose final refined solutions can be confidently matched to their corresponding initial phasing results are retained. The resulting dataset contains over 50,000 structures, spanning organic, organometallic, and inorganic crystals, and covers 83 elements and 86 space groups.
 
+Dataset repo:
+
+- `Kaipengm2/CrystalX-dataset`
+- `https://huggingface.co/datasets/Kaipengm2/CrystalX-dataset`
 
 Training and dataset-level evaluation use preprocessed `equiv_*.pt` records plus a plain-text split file.
 
@@ -209,6 +213,11 @@ python -m crystalx_infer.pipelines.infer_heavy_temporal --help
 python -m crystalx_infer.pipelines.infer_hydro_temporal --help
 python -m crystalx_infer.pipelines.infer_joint_heavy_hydro_temporal --help
 ```
+
+Both training and dataset-level evaluation now support two split modes:
+
+- `--split_mode year` uses the existing year-based split from `sorted_by_journal_year.txt` plus `--test_years`.
+- `--split_mode random --random_train_ratio 0.8 --random_test_ratio 0.2 --split_seed 150` performs a reproducible random 80/20 train-test split over the available `equiv_*.pt` files.
 
 ## Citation
 

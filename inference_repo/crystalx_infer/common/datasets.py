@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import random
 
 import numpy as np
 import torch
@@ -28,6 +29,13 @@ def _optional_noise_passes_threshold(mol_info, max_abs_threshold):
     return float(np.max(np.abs(noise))) <= float(max_abs_threshold)
 
 
+def _load_dataset_pt(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 def split_by_year_txt(
     txt_path: str,
     pt_dir: str,
@@ -35,10 +43,29 @@ def split_by_year_txt(
     pt_prefix="equiv_",
     pt_suffix=".pt",
     strict=False,
+    split_mode="year",
+    random_train_ratio=0.8,
+    random_test_ratio=0.2,
+    split_seed=150,
 ):
+    split_mode = str(split_mode).strip().lower()
+    if split_mode not in {"year", "random"}:
+        raise ValueError(f"Unsupported split_mode={split_mode!r}. Expected 'year' or 'random'.")
+
+    if split_mode == "random":
+        ratio_sum = float(random_train_ratio) + float(random_test_ratio)
+        if float(random_train_ratio) <= 0 or float(random_test_ratio) <= 0:
+            raise ValueError("random_train_ratio and random_test_ratio must both be positive.")
+        if abs(ratio_sum - 1.0) > 1e-8:
+            raise ValueError(
+                "random_train_ratio and random_test_ratio must sum to 1.0, "
+                f"got {random_train_ratio} + {random_test_ratio} = {ratio_sum}."
+            )
+
     test_years = set(str(year) for year in test_years)
 
     train_files, test_files = [], []
+    listed_files = []
     missing = []
     seen = set()
 
@@ -66,21 +93,40 @@ def split_by_year_txt(
                 missing.append(pt_path)
                 continue
 
-            if year in test_years:
-                test_files.append(pt_path)
-            else:
-                train_files.append(pt_path)
+            listed_files.append(pt_path)
+            if split_mode == "year":
+                if year in test_years:
+                    test_files.append(pt_path)
+                else:
+                    train_files.append(pt_path)
 
+    extra = []
     if not strict:
+        listed_set = set(listed_files)
         all_pt = [
             os.path.join(pt_dir, filename)
             for filename in os.listdir(pt_dir)
             if filename.endswith(pt_suffix)
         ]
-        test_set = set(test_files)
-        listed_set = set(train_files) | test_set
-        extra = [path for path in all_pt if path not in listed_set and path not in test_set]
-        train_files += extra
+        extra = [path for path in all_pt if path not in listed_set]
+        if split_mode == "year":
+            train_files += extra
+
+    if split_mode == "random":
+        candidate_files = sorted(set(listed_files) | set(extra))
+        if not candidate_files:
+            return [], [], missing
+
+        shuffled = sorted(candidate_files)
+        random.Random(int(split_seed)).shuffle(shuffled)
+        if len(shuffled) == 1:
+            return [], shuffled, missing
+
+        test_count = int(round(len(shuffled) * float(random_test_ratio)))
+        test_count = max(1, min(test_count, len(shuffled) - 1))
+        test_set = set(shuffled[:test_count])
+        train_files = sorted(path for path in shuffled if path not in test_set)
+        test_files = sorted(test_set)
 
     return train_files, test_files, missing
 
@@ -97,7 +143,7 @@ def build_heavy_eval_dataset(file_list, is_eval=True, is_check_dist=True):
     }
 
     for fname in tqdm(file_list, desc="Build heavy dataset"):
-        mol_info = torch.load(fname)
+        mol_info = _load_dataset_pt(fname)
 
         if not _optional_noise_passes_threshold(mol_info, 0.1):
             stats["noise_drop"] += 1
@@ -165,7 +211,7 @@ def build_hydro_eval_dataset(file_list, is_check_dist=False, is_filter=False):
     max_h = -1
 
     for fname in tqdm(file_list, desc="Build hydro dataset"):
-        mol_info = torch.load(fname)
+        mol_info = _load_dataset_pt(fname)
 
         try:
             z_equiv = atomic_num_list([item.capitalize() for item in mol_info["equiv_gt"]])
@@ -250,7 +296,7 @@ def build_joint_dataset(file_list, heavy_noise_max=0.1, is_check_dist=True, dist
 
     for fname in tqdm(file_list, desc="Build joint dataset"):
         try:
-            mol = torch.load(fname)
+            mol = _load_dataset_pt(fname)
         except Exception:
             stats["drop_missing_keys"] += 1
             continue

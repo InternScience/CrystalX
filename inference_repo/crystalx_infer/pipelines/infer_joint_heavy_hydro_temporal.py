@@ -40,6 +40,10 @@ class JointEvalConfig:
     pt_prefix: str = "equiv_"
     pt_suffix: str = ".pt"
     strict: bool = False
+    split_mode: str = "year"
+    random_train_ratio: float = 0.8
+    random_test_ratio: float = 0.2
+    split_seed: int = 150
     seed: int = 183
     device: str = "auto"
     batch_size: int = 1
@@ -446,6 +450,10 @@ def run_evaluation(config: JointEvalConfig) -> None:
         pt_prefix=config.pt_prefix,
         pt_suffix=config.pt_suffix,
         strict=config.strict,
+        split_mode=config.split_mode,
+        random_train_ratio=config.random_train_ratio,
+        random_test_ratio=config.random_test_ratio,
+        split_seed=config.split_seed,
     )
     excluded_cnt = 0
     if config.exclude_disorder_txt:
@@ -558,6 +566,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pt_prefix", type=str, default=JointEvalConfig.pt_prefix)
     parser.add_argument("--pt_suffix", type=str, default=JointEvalConfig.pt_suffix)
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--split_mode", type=str, choices=["year", "random"], default=JointEvalConfig.split_mode)
+    parser.add_argument("--random_train_ratio", type=float, default=JointEvalConfig.random_train_ratio)
+    parser.add_argument("--random_test_ratio", type=float, default=JointEvalConfig.random_test_ratio)
+    parser.add_argument("--split_seed", type=int, default=JointEvalConfig.split_seed)
     parser.add_argument("--seed", type=int, default=JointEvalConfig.seed)
     parser.add_argument("--device", type=str, default=JointEvalConfig.device, choices=["auto", "cuda", "cpu"])
     parser.add_argument("--batch_size", type=int, default=JointEvalConfig.batch_size)
@@ -612,6 +624,10 @@ def main() -> None:
         pt_prefix=args.pt_prefix,
         pt_suffix=args.pt_suffix,
         strict=args.strict,
+        split_mode=args.split_mode,
+        random_train_ratio=args.random_train_ratio,
+        random_test_ratio=args.random_test_ratio,
+        split_seed=args.split_seed,
         seed=args.seed,
         device=args.device,
         batch_size=args.batch_size,

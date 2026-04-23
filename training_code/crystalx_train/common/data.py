@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import random
 from typing import Sequence
 
 import numpy as np
+import torch
 from scipy.spatial.distance import cdist
 
 
 @dataclass(frozen=True)
 class SplitSpec:
-    """Dataset split configuration based on year metadata and pt file layout."""
+    """Dataset split configuration based on txt metadata and pt file layout."""
 
     txt_path: str
     pt_dir: str
@@ -18,17 +20,72 @@ class SplitSpec:
     pt_prefix: str = "equiv_"
     pt_suffix: str = ".pt"
     strict: bool = False
+    split_mode: str = "year"
+    random_train_ratio: float = 0.8
+    random_test_ratio: float = 0.2
+    split_seed: int = 150
 
     def normalized_test_years(self) -> set[str]:
         return {str(year) for year in self.test_years}
 
+    def normalized_split_mode(self) -> str:
+        return self.split_mode.strip().lower()
+
+
+def _validate_random_ratios(train_ratio: float, test_ratio: float) -> None:
+    total = float(train_ratio) + float(test_ratio)
+    if float(train_ratio) <= 0 or float(test_ratio) <= 0:
+        raise ValueError("random_train_ratio and random_test_ratio must both be positive.")
+    if abs(total - 1.0) > 1e-8:
+        raise ValueError(
+            "random_train_ratio and random_test_ratio must sum to 1.0, "
+            f"got {train_ratio} + {test_ratio} = {total}."
+        )
+
+
+def load_dataset_pt(path: str):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _random_split_files(
+    candidate_files: list[str],
+    *,
+    train_ratio: float,
+    test_ratio: float,
+    split_seed: int,
+) -> tuple[list[str], list[str]]:
+    _validate_random_ratios(train_ratio, test_ratio)
+    if not candidate_files:
+        return [], []
+
+    shuffled = sorted(candidate_files)
+    random.Random(split_seed).shuffle(shuffled)
+
+    if len(shuffled) == 1:
+        return [], shuffled
+
+    test_count = int(round(len(shuffled) * float(test_ratio)))
+    test_count = max(1, min(test_count, len(shuffled) - 1))
+    test_set = set(shuffled[:test_count])
+    train_files = sorted(path for path in shuffled if path not in test_set)
+    test_files = sorted(test_set)
+    return train_files, test_files
+
 
 def split_by_year_txt(spec: SplitSpec) -> tuple[list[str], list[str], list[str]]:
+    split_mode = spec.normalized_split_mode()
+    if split_mode not in {"year", "random"}:
+        raise ValueError(f"Unsupported split_mode={spec.split_mode!r}. Expected 'year' or 'random'.")
+
     test_years = spec.normalized_test_years()
     pt_dir = Path(spec.pt_dir)
 
     train_files: list[str] = []
     test_files: list[str] = []
+    listed_files: list[str] = []
     missing: list[str] = []
     seen: set[str] = set()
 
@@ -55,21 +112,34 @@ def split_by_year_txt(spec: SplitSpec) -> tuple[list[str], list[str], list[str]]
                 missing.append(pt_path)
                 continue
 
-            if year in test_years:
-                test_files.append(pt_path)
-            else:
-                train_files.append(pt_path)
+            listed_files.append(pt_path)
+            if split_mode == "year":
+                if year in test_years:
+                    test_files.append(pt_path)
+                else:
+                    train_files.append(pt_path)
 
+    extra_files: list[str] = []
     if not spec.strict and pt_dir.exists():
-        listed_files = set(train_files) | set(test_files)
-        extra_train_files = sorted(
+        listed_path_set = set(listed_files)
+        extra_files = sorted(
             str(path)
             for path in pt_dir.iterdir()
             if path.is_file()
             and path.name.endswith(spec.pt_suffix)
-            and str(path) not in listed_files
+            and str(path) not in listed_path_set
         )
-        train_files.extend(extra_train_files)
+        if split_mode == "year":
+            train_files.extend(extra_files)
+
+    if split_mode == "random":
+        candidate_files = sorted(set(listed_files) | set(extra_files))
+        return _random_split_files(
+            candidate_files,
+            train_ratio=spec.random_train_ratio,
+            test_ratio=spec.random_test_ratio,
+            split_seed=spec.split_seed,
+        ) + (missing,)
 
     return train_files, test_files, missing
 

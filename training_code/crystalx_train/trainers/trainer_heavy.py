@@ -21,6 +21,7 @@ from crystalx_train.common import (
     deduplicate_positions,
     get_run_timestamp,
     is_distance_valid,
+    load_dataset_pt,
     preview_missing_files,
     resolve_device,
     set_seed,
@@ -48,6 +49,10 @@ class HeavyTrainingConfig:
     pt_prefix: str = "equiv_"
     pt_suffix: str = ".pt"
     strict: bool = False
+    split_mode: str = "year"
+    random_train_ratio: float = 0.8
+    random_test_ratio: float = 0.2
+    split_seed: int = 150
     check_dist: bool = True
     learning_rate: float = 1e-4
     beta1: float = 0.9
@@ -93,7 +98,7 @@ def build_heavy_dataset(
 
     desc = "Build heavy eval dataset" if is_eval else "Build heavy train dataset"
     for fname in tqdm(file_list, desc=desc):
-        mol_info = torch.load(fname)
+        mol_info = load_dataset_pt(fname)
         if not required_keys.issubset(mol_info.keys()):
             stats["missing_key_drop"] += 1
             continue
@@ -290,6 +295,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     data_group.add_argument("--pt_prefix", type=str, default="equiv_")
     data_group.add_argument("--pt_suffix", type=str, default=".pt")
     data_group.add_argument("--strict", action="store_true")
+    data_group.add_argument("--split_mode", type=str, choices=["year", "random"], default="year")
+    data_group.add_argument("--random_train_ratio", type=float, default=0.8)
+    data_group.add_argument("--random_test_ratio", type=float, default=0.2)
+    data_group.add_argument("--split_seed", type=int, default=150)
     data_group.add_argument("--no_dist_check", action="store_true")
 
     optimization_group = parser.add_argument_group("optimization")
@@ -331,6 +340,10 @@ def config_from_args(args: argparse.Namespace) -> HeavyTrainingConfig:
         pt_prefix=args.pt_prefix,
         pt_suffix=args.pt_suffix,
         strict=args.strict,
+        split_mode=args.split_mode,
+        random_train_ratio=args.random_train_ratio,
+        random_test_ratio=args.random_test_ratio,
+        split_seed=args.split_seed,
         check_dist=not args.no_dist_check,
         learning_rate=args.learning_rate,
         beta1=args.beta1,
@@ -408,6 +421,10 @@ def run_training(config: HeavyTrainingConfig) -> None:
         pt_prefix=config.pt_prefix,
         pt_suffix=config.pt_suffix,
         strict=config.strict,
+        split_mode=config.split_mode,
+        random_train_ratio=config.random_train_ratio,
+        random_test_ratio=config.random_test_ratio,
+        split_seed=config.split_seed,
     )
     train_files, test_files, missing = split_by_year_txt(split_spec)
     print(f"Train files: {len(train_files)}")

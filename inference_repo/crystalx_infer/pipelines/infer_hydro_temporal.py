@@ -40,6 +40,10 @@ class HydroEvalConfig:
     pt_prefix: str = "equiv_"
     pt_suffix: str = ".pt"
     strict: bool = False
+    split_mode: str = "year"
+    random_train_ratio: float = 0.8
+    random_test_ratio: float = 0.2
+    split_seed: int = 150
     batch_size: int = 1
     seed: int = 183
     num_classes: int = 0
@@ -276,6 +280,10 @@ def run_evaluation(config: HydroEvalConfig) -> None:
         pt_prefix=config.pt_prefix,
         pt_suffix=config.pt_suffix,
         strict=config.strict,
+        split_mode=config.split_mode,
+        random_train_ratio=config.random_train_ratio,
+        random_test_ratio=config.random_test_ratio,
+        split_seed=config.split_seed,
     )
     print(f"Test files: {len(test_files)} | Missing mapped pt: {len(missing)}")
 
@@ -352,6 +360,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pt_prefix", type=str, default=HydroEvalConfig.pt_prefix)
     parser.add_argument("--pt_suffix", type=str, default=HydroEvalConfig.pt_suffix)
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--split_mode", type=str, choices=["year", "random"], default=HydroEvalConfig.split_mode)
+    parser.add_argument("--random_train_ratio", type=float, default=HydroEvalConfig.random_train_ratio)
+    parser.add_argument("--random_test_ratio", type=float, default=HydroEvalConfig.random_test_ratio)
+    parser.add_argument("--split_seed", type=int, default=HydroEvalConfig.split_seed)
     parser.add_argument("--batch_size", type=int, default=HydroEvalConfig.batch_size)
     parser.add_argument("--seed", type=int, default=HydroEvalConfig.seed)
     parser.add_argument("--num_classes", type=int, default=HydroEvalConfig.num_classes)
@@ -390,6 +402,10 @@ def main() -> None:
         pt_prefix=args.pt_prefix,
         pt_suffix=args.pt_suffix,
         strict=args.strict,
+        split_mode=args.split_mode,
+        random_train_ratio=args.random_train_ratio,
+        random_test_ratio=args.random_test_ratio,
+        split_seed=args.split_seed,
         batch_size=args.batch_size,
         seed=args.seed,
         num_classes=args.num_classes,

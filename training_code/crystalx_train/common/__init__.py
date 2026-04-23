@@ -4,6 +4,7 @@ from crystalx_train.common.data import (
     SplitSpec,
     deduplicate_positions,
     is_distance_valid,
+    load_dataset_pt,
     split_by_year_txt,
     symbols_to_atomic_numbers,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "deduplicate_positions",
     "get_run_timestamp",
     "is_distance_valid",
+    "load_dataset_pt",
     "preview_missing_files",
     "resolve_device",
     "set_seed",

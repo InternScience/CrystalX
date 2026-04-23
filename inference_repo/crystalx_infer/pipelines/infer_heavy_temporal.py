@@ -25,6 +25,10 @@ class HeavyEvalConfig:
     model_path: str = HEAVY_CHECKPOINT.filename
     hf_repo_id: str = ""
     test_years: tuple[int, ...] = (2018, 2019, 2020, 2021, 2022, 2023, 2024)
+    split_mode: str = "year"
+    random_train_ratio: float = 0.8
+    random_test_ratio: float = 0.2
+    split_seed: int = 150
     batch_size: int = 1
     seed: int = 150
     device: str = "auto"
@@ -171,6 +175,10 @@ def run_evaluation(config: HeavyEvalConfig) -> None:
         pt_prefix="equiv_",
         pt_suffix=".pt",
         strict=False,
+        split_mode=config.split_mode,
+        random_train_ratio=config.random_train_ratio,
+        random_test_ratio=config.random_test_ratio,
+        split_seed=config.split_seed,
     )
     print(f"Test files: {len(test_files)} | Missing mapped pt: {len(missing)}")
 
@@ -222,6 +230,10 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=list(HeavyEvalConfig.test_years),
     )
+    parser.add_argument("--split_mode", type=str, choices=["year", "random"], default=HeavyEvalConfig.split_mode)
+    parser.add_argument("--random_train_ratio", type=float, default=HeavyEvalConfig.random_train_ratio)
+    parser.add_argument("--random_test_ratio", type=float, default=HeavyEvalConfig.random_test_ratio)
+    parser.add_argument("--split_seed", type=int, default=HeavyEvalConfig.split_seed)
     parser.add_argument("--batch_size", type=int, default=HeavyEvalConfig.batch_size)
     parser.add_argument("--seed", type=int, default=HeavyEvalConfig.seed)
     parser.add_argument("--device", type=str, default=HeavyEvalConfig.device, choices=["auto", "cuda", "cpu"])
@@ -252,6 +264,10 @@ def main() -> None:
         model_path=args.model_path,
         hf_repo_id=args.hf_repo_id,
         test_years=tuple(args.test_years),
+        split_mode=args.split_mode,
+        random_train_ratio=args.random_train_ratio,
+        random_test_ratio=args.random_test_ratio,
+        split_seed=args.split_seed,
         batch_size=args.batch_size,
         seed=args.seed,
         device=args.device,
