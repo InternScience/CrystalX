@@ -147,11 +147,13 @@ Training and dataset-level evaluation use preprocessed `equiv_*.pt` records plus
 
 Each `equiv_*.pt` file is a Python dictionary saved with `torch.save`.
 
+The input `z` and `pos` describe the coarse electron-density peaks obtained from **SHELXT** initial phasing. `pos` is read from the initial phasing result and converted directly into Cartesian coordinates of the electron-density peaks; entries are ordered from strongest to weakest peak. `z` is an input peak descriptor used to encode the relative strength or initial chemical interpretation of those coarse density peaks, not the final supervised atom label. In practice, `z` can be assigned from the known or estimated elemental composition ordered from heavier/stronger-scattering elements to lighter/weaker-scattering elements, or it can use the initial element assignment produced by **SHELXT**.
+
 Heavy-atom training / heavy evaluation require at least:
 
 ```python
 {
-  "z": ["C", "N", "O", ...],              # input element symbols aligned with pos
+  "z": ["C", "N", "O", ...],              # input peak descriptors aligned with pos
   "gt": ["C", "N", "O", ...],             # target heavy-atom labels for the main atoms
   "pos": np.ndarray,                      # shape [N, 3], Cartesian coordinates in angstrom
 }
@@ -183,6 +185,8 @@ Joint evaluation expects the union of both schemas:
 Important conventions used by the loaders:
 
 - `pos[i]` is aligned with the symbol entry at the same index, such as `z[i]` or `equiv_gt[i]`.
+- For heavy-atom inputs, `pos` follows the SHELXT coarse electron-density peak order, from stronger to weaker peaks.
+- `z` should be interpreted as an input descriptor or initial element guess for each coarse peak; the final training target remains `gt`.
 - Element symbols must be valid RDKit-readable symbols, for example `C`, `N`, `O`, `Cl`, `Br`, `Zn`.
 - `gt` contains only the main non-hydrogen atoms used as labels.
 - `hydro_gt[j]` is the hydrogen count attached to `gt[j]`; hydrogen coordinates themselves are not stored in the training target.
